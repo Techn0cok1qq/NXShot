@@ -1,3 +1,4 @@
+<img src="NXShot.png" width="600">
 # NXDiscord 1.0.1
 
 Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)です。
