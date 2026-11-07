@@ -1,4 +1,4 @@
-# NXDiscord 1.1.0
+# NXDiscord 1.1.1
 
 Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)です。
 **Switch単体で**、ゲームの開始・終了と、撮ったスクリーンショットや動画をDiscordのWebhookへ送ります。PCは要りません。
@@ -17,7 +17,7 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 - Wi-Fi(スクショの保存先はSDカード)
 
 ## インストール
-1. [Releases](../../releases) から `NXDiscord-1.1.0.zip` をダウンロードして展開します。
+1. [Releases](../../releases) から `NXDiscord-1.1.1.zip` をダウンロードして展開します。
 2. 中の `atmosphere` と `config` の2つのフォルダを、SDカードの直下にコピーします。
 3. SDカードの `config/nxdiscord/config.txt` を開き、1行目の `[ここにWebhook URLを貼る]` を、自分のWebhook URLに書き換えて保存します(カッコも消して、URLだけにします)。2行目の `limit=10` はそのままで大丈夫です(下の「動画について」)。
 4. Switchを再起動します。起動してしばらくすると、Discordに「🟢 NXDiscord 起動」が届きます。
@@ -38,6 +38,7 @@ SDカードの中身はこうなります。
 - Switchで撮った動画(最長30秒)も、スクリーンショットと同じように自動で送ります。
 - Discordには、アップロードできるファイルの大きさに**上限**があります(ブーストなしのサーバーでは約10MB。Discord側の都合で変わることがあります)。Switchの動画はこれを超えることがあります。
 - 上限を超える場合は、ファイルは送らず、「ファイルが大きいため送れませんでした」とだけ通知します。
+- `limit=` 以下でも、Discordのサーバーに断られた場合(http 413など)は、「送信失敗」と通知します。この場合は `limit=` を、実際に送れた大きさまで下げてください。
 - ブーストしているサーバーなら、`config.txt` の `limit=` を大きくすると、大きい動画も送れます(例: `limit=50`)。サーバーの上限より大きくすると、送信に失敗します。
 - 動画は送るのに時間がかかります。その間は、ゲームの開始・終了の通知が少し遅れることがあります。
 
@@ -49,7 +50,7 @@ SDカードの中身はこうなります。
 
 | ログの内容 | 意味 |
 |---|---|
-| `main: start v1.1.0` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
+| `main: start v1.1.1` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
 | `network: 未接続` のまま | Wi-Fiにつながっていません |
 | `curl: global_init=0` 以外 | 通信ライブラリの初期化失敗 |
 | `postJson` / `postShot` の `http 200〜204` | 送信成功 |
