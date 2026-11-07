@@ -1,7 +1,7 @@
 # 更新履歴
 
 ## 1.0.1
-- 配布zipに、ひな形の `config.txt`(`[ここにWebhook URLを貼る]`)を最初から同梱
+- 配布zipに、 `config.txt`(`[ここにWebhook URLを貼る]`)を最初から同梱
 - READMEの設定手順を更新
 
 ## 1.0.0
