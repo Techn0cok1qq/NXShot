@@ -1,0 +1,52 @@
+name: buildnro
+
+on:
+  push:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ツールを入れる
+        run: apt-get update && apt-get install -y zip
+
+      - name: 常駐版をビルド
+        run: make -C sysmodule
+
+      - name: アプリ用のライブラリを入れる
+        run: dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-curl
+
+      - name: アプリ(nro)をビルド
+        run: make -C app
+
+      - name: 配布用にまとめる
+        run: |
+          D=pkg/atmosphere/contents/4200000000000A7E
+          mkdir -p $D/flags pkg/config/nxdiscord
+          cp sysmodule/out/nxdiscord.nsp $D/exefs.nsp
+          mkdir -p pkg/switch/NXDiscord
+          cp app/out/NXDiscord.nro pkg/switch/NXDiscord/NXDiscord.nro
+          touch $D/flags/boot2.flag
+          printf '[ここにWebhook URLを貼る]\nlimit=10\n' > pkg/config/nxdiscord/config.txt
+          cp README.md LICENSE CHANGELOG.md pkg/
+          (cd pkg && zip -qr ../NXDiscord-1.2.0.zip .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NXDiscord-1.2.0
+          path: pkg
+
+      - name: Releaseに添付する
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: NXDiscord-1.2.0.zip
