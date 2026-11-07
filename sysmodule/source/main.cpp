@@ -1,7 +1,7 @@
 // NXDiscord sysmodule (PC不要版)
 // ・Switch単体で、DiscordのWebhookへ直接HTTPS送信する
 //   - ゲームの開始 / 終了(プレイ時間つき)の通知
-//   - SDカードのAlbumに増えた新しいスクリーンショット(jpg)の自動投稿
+//   - SDカードのAlbumに増えた新しいスクリーンショット(jpg)と動画(mp4)の自動投稿
 // 依存: libnx + libcurl(switch-curl。HTTPSはlibnxのsslサービス経由)
 #include <switch.h>
 #include <curl/curl.h>
@@ -19,8 +19,8 @@
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
-#define MAX_SHOT_BYTES (8 * 1024 * 1024)
-#define VERSION "1.0.0"
+#define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
+#define VERSION "1.1.0"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
 
@@ -123,10 +123,13 @@ void __appExit(void) {
 // ---- 設定 ----
 // config.txt
 //   1行目: DiscordのWebhook URL(必須)
-//   2行目: Albumフォルダの場所(省略可。通常は書かない)
+//   2行目以降(省略可):
+//     limit=10            送信できるファイルの上限(MB)
+//     album=sdmc:/...     Albumフォルダの場所(通常は書かない)
 struct Config {
     std::string hook;
     std::string album;
+    long limitMB = DEFAULT_LIMIT_MB;
 };
 
 static std::string trimLine(const char *line) {
@@ -140,13 +143,25 @@ static std::string trimLine(const char *line) {
 static bool loadConfig(Config &c) {
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return false;
-    char l1[512] = {0}, l2[256] = {0};
-    bool ok = fgets(l1, sizeof(l1), f) != nullptr;
-    if (ok) fgets(l2, sizeof(l2), f);
+    char line[512];
+    int n = 0;
+    bool ok = false;
+    while (n < 12 && fgets(line, sizeof(line), f)) {
+        n++;
+        std::string t = trimLine(line);
+        if (n == 1) { c.hook = t; ok = true; continue; }
+        if (t.empty()) continue;
+        if (t.compare(0, 6, "limit=") == 0) {
+            long v = atol(trimLine(t.c_str() + 6).c_str());
+            if (v >= 1 && v <= 500) c.limitMB = v;
+        } else if (t.compare(0, 6, "album=") == 0) {
+            c.album = trimLine(t.c_str() + 6);
+        } else if (c.album.empty() && t.compare(0, 6, "sdmc:/") == 0) {
+            c.album = t;  // 古い書き方(2行目にAlbumの場所だけ)
+        }
+    }
     fclose(f);
     if (!ok) return false;
-    c.hook = trimLine(l1);
-    c.album = trimLine(l2);
     if (c.album.empty()) c.album = DEFAULT_ALBUM;
     while (c.album.size() > 1 && c.album.back() == '/') c.album.pop_back();
     return c.hook.compare(0, 8, "https://") == 0;
@@ -282,12 +297,14 @@ static long postJson(const std::string &url, const std::string &json) {
     return code;
 }
 
-static long postShot(const std::string &url, const std::string &payload, const std::string &path) {
+static long postShot(const std::string &url, const std::string &payload, const std::string &path,
+                     const char *attachName, const char *mime, long timeoutSec) {
     if (!g_curlReady) return -1;
     nxlog("postShot: easy_init (%s)", path.c_str());
     CURL *c = curl_easy_init();
     if (!c) { nxlog("postShot: easy_init failed"); return -1; }
     setCommon(c, url);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, timeoutSec);
     struct curl_slist *h = curl_slist_append(nullptr, "Expect:");
     curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
 
@@ -299,8 +316,8 @@ static long postShot(const std::string &url, const std::string &payload, const s
     p = curl_mime_addpart(m);
     curl_mime_name(p, "files[0]");
     curl_mime_filedata(p, path.c_str());
-    curl_mime_filename(p, "screenshot.jpg");
-    curl_mime_type(p, "image/jpeg");
+    curl_mime_filename(p, attachName);
+    curl_mime_type(p, mime);
     curl_easy_setopt(c, CURLOPT_MIMEPOST, m);
 
     long code = -1;
@@ -342,17 +359,22 @@ static void flushQueue(const Config &cfg) {
 }
 
 // ---- スクリーンショット ----
-// Albumの構造: <album>/<年>/<月>/<日>/<日時>-<ハッシュ>.jpg
+// Albumの構造: <album>/<年>/<月>/<日>/<日時>-<ハッシュ>.jpg (動画は .mp4)
 static std::string g_lastSent;
 static bool g_albumInit = false;
 static std::string g_pendingName;
 static long g_pendingSize = -1;
 
-static bool endsWithJpg(const std::string &n) {
-    if (n.size() < 4) return false;
-    std::string e = n.substr(n.size() - 4);
+enum { MK_NONE = 0, MK_IMAGE = 1, MK_VIDEO = 2 };
+
+static int mediaKind(const std::string &n) {
+    size_t dot = n.rfind('.');
+    if (dot == std::string::npos) return MK_NONE;
+    std::string e = n.substr(dot + 1);
     for (auto &c : e) c = (char)tolower((unsigned char)c);
-    return e == ".jpg";
+    if (e == "jpg" || e == "jpeg") return MK_IMAGE;
+    if (e == "mp4") return MK_VIDEO;
+    return MK_NONE;
 }
 
 static void listDir(const std::string &path, std::vector<std::string> &dirs, std::vector<std::string> &files) {
@@ -380,7 +402,7 @@ static bool newestSub(const std::string &path, std::string &out) {
     return found;
 }
 
-static bool scanNewestDay(const std::string &album, std::string &dayPath, std::vector<std::string> &jpgs) {
+static bool scanNewestDay(const std::string &album, std::string &dayPath, std::vector<std::string> &media) {
     std::string y, m, d;
     if (!newestSub(album, y)) return false;
     std::string p = album + "/" + y;
@@ -390,7 +412,7 @@ static bool scanNewestDay(const std::string &album, std::string &dayPath, std::v
     dayPath = p + "/" + d;
     std::vector<std::string> dirs, files;
     listDir(dayPath, dirs, files);
-    for (auto &f : files) if (endsWithJpg(f)) jpgs.push_back(f);
+    for (auto &f : files) if (mediaKind(f) != MK_NONE) media.push_back(f);
     return true;
 }
 
@@ -414,7 +436,19 @@ static void checkScreenshots(const Config &cfg) {
     std::string full = dayPath + "/" + next;
     struct stat st;
     if (stat(full.c_str(), &st) != 0 || st.st_size <= 0) return;
-    if (st.st_size > MAX_SHOT_BYTES) { g_lastSent = next; return; }
+    bool isVideo = mediaKind(next) == MK_VIDEO;
+    if ((long long)st.st_size + 65536 > (long long)cfg.limitMB * 1048576LL) {
+        // 上限を超えるファイルは送れない。撮ったことだけ通知する
+        char msg[256];
+        snprintf(msg, sizeof(msg), "ファイルが大きいため送れませんでした(%.1fMB / 上限%ldMB)。config.txtのlimit=で上限を変えられます。",
+                 st.st_size / 1048576.0, cfg.limitMB);
+        nxlog("media: 上限超え %s (%lld bytes, limit=%ldMB)", next.c_str(), (long long)st.st_size, cfg.limitMB);
+        std::string d = g_curTitle.empty() ? std::string(msg) : g_curTitle + "\n" + msg;
+        enqueue(embedJson(isVideo ? "🎬 動画(未送信)" : "📸 スクリーンショット(未送信)", d, 10070709));
+        g_lastSent = next;
+        g_pendingName.clear();
+        return;
+    }
 
     // 書き込み中に送らないよう、前回とサイズが同じになってから送る
     if (g_pendingName != next || g_pendingSize != (long)st.st_size) {
@@ -423,11 +457,17 @@ static void checkScreenshots(const Config &cfg) {
         return;
     }
 
-    std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"📸 スクリーンショット\"";
+    std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" +
+                          (isVideo ? "🎬 動画" : "📸 スクリーンショット") + "\"";
     if (!g_curTitle.empty()) payload += ",\"description\":\"" + jsonEscape(g_curTitle) + "\"";
-    payload += ",\"color\":15277667,\"image\":{\"url\":\"attachment://screenshot.jpg\"}}]}";
+    payload += ",\"color\":15277667";
+    if (!isVideo) payload += ",\"image\":{\"url\":\"attachment://screenshot.jpg\"}";
+    payload += "}]}";
 
-    long code = postShot(cfg.hook, payload, full);
+    // 大きいファイルほど時間がかかるので、送信の制限時間を長めにする
+    long timeoutSec = 60 + (long)(st.st_size / 1048576) * 8;
+    long code = postShot(cfg.hook, payload, full, isVideo ? "video.mp4" : "screenshot.jpg",
+                         isVideo ? "video/mp4" : "image/jpeg", timeoutSec);
     if (isFinal(code)) {
         g_lastSent = next;
         g_pendingName.clear();
@@ -439,7 +479,9 @@ static std::string albumReport(const Config &cfg) {
     std::vector<std::string> names;
     if (!scanNewestDay(cfg.album, dayPath, names))
         return "Albumを読めません。設定→データ管理→スクリーンショットと動画の管理→保存先がSDカードか確認してください。\n場所: " + cfg.album;
-    return "Albumを読めました。最新の日の写真: " + std::to_string(names.size()) + "枚";
+    int img = 0, vid = 0;
+    for (auto &n : names) { if (mediaKind(n) == MK_VIDEO) vid++; else img++; }
+    return "Albumを読めました。最新の日の写真: " + std::to_string(img) + "枚 / 動画: " + std::to_string(vid) + "本\n送信できるファイルの上限: " + std::to_string(cfg.limitMB) + "MB";
 }
 
 // ---- メイン ----
