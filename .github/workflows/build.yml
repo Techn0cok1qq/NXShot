@@ -19,26 +19,50 @@ jobs:
       - name: ツールを入れる
         run: apt-get update && apt-get install -y zip
 
-      - name: ビルド
+      - name: 常駐版をビルド
         run: make -C sysmodule
+
+      - name: アプリ用のライブラリを入れる
+        run: |
+          # pkg.devkitpro.org が一時的に 403 を返すことがあるので、間隔をあけて最大6回リトライ
+          for i in 1 2 3 4 5 6; do
+            if dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl; then
+              exit 0
+            fi
+            echo "失敗($i/6)。$((i*20))秒待って再試行します"
+            sleep $((i*20))
+          done
+          exit 1
+
+      - name: 動画プレビュー用の ffmpeg を入れる(入らなくてもビルドは続く)
+        run: dkp-pacman -S --noconfirm switch-ffmpeg || echo "switch-ffmpeg なしでビルドします(動画のプレビューは使えません)"
+
+      - name: アプリ(nro)をビルド
+        run: |
+          echo "--- pkg-config の結果 ---"
+          /opt/devkitpro/portlibs/switch/bin/aarch64-none-elf-pkg-config --libs --static sdl2 SDL2_ttf SDL2_image libcurl || true
+          ls /opt/devkitpro/portlibs/switch/lib | grep -i sdl2 || true
+          make -C app
 
       - name: 配布用にまとめる
         run: |
           D=pkg/atmosphere/contents/4200000000000A7E
           mkdir -p $D/flags pkg/config/nxdiscord
           cp sysmodule/out/nxdiscord.nsp $D/exefs.nsp
+          mkdir -p pkg/switch/NXShot
+          cp app/out/NXShot.nro pkg/switch/NXShot/NXShot.nro
           touch $D/flags/boot2.flag
-          printf '[ここにWebhook URLを貼る]\nlimit=20\n' > pkg/config/nxdiscord/config.txt
+          printf '[ここにWebhook URLを貼る]\nlimit=10\nauto=1\n' > pkg/config/nxdiscord/config.txt
           cp README.md LICENSE CHANGELOG.md pkg/
-          (cd pkg && zip -qr ../NXDiscord-1.1.2.zip .)
+          (cd pkg && zip -qr ../NXShot-1.2.0.zip .)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NXDiscord-1.1.2
+          name: NXShot-1.2.0
           path: pkg
 
       - name: Releaseに添付する
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: NXDiscord-1.1.2.zip
+          files: NXShot-1.2.0.zip
