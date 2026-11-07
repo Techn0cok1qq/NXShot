@@ -1,4 +1,4 @@
-# NXDiscord 1.0.0
+# NXDiscord 1.0.1
 
 Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)です。
 **Switch単体で**、ゲームの開始・終了と、撮ったスクリーンショットをDiscordのWebhookへ送ります。PCは要りません。
@@ -16,11 +16,10 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 - Wi-Fi(スクショの保存先はSDカード)
 
 ## インストール
-1. [Releases](../../releases) から `NXDiscord-1.0.0.zip` をダウンロードして展開します。
-2. 中の `atmosphere` フォルダを、SDカードの直下にコピーします。
-3. `config/nxdiscord/config.txt.example` を `config.txt` に名前を変えて、SDカードの `config/nxdiscord/` に置きます。
-4. `config.txt` の1行目を、自分のWebhook URLに書き換えます。
-5. Switchを再起動します。起動してしばらくすると、Discordに「🟢 NXDiscord 起動」が届きます。
+1. [Releases](../../releases) から `NXDiscord-1.0.1.zip` をダウンロードして展開します。
+2. 中の `atmosphere` と `config` の2つのフォルダを、SDカードの直下にコピーします。
+3. SDカードの `config/nxdiscord/config.txt` を開き、`[ここにWebhook URLを貼る]` の部分を、自分のWebhook URLに書き換えて保存します(カッコも消して、URLだけにします)。
+4. Switchを再起動します。起動してしばらくすると、Discordに「🟢 NXDiscord 起動」が届きます。
 
 SDカードの中身はこうなります。
 
@@ -30,6 +29,8 @@ SDカードの中身はこうなります。
         1行目: DiscordのWebhook URL
         2行目: (省略可)Albumの場所。通常は書かない
 
+**すでに自分の `config.txt` がある人へ**: 上書きしないでください。`config` フォルダはコピーせず、`atmosphere` だけを入れ替えれば、設定はそのまま使えます。
+
 ## アンインストール
 `atmosphere/contents/4200000000000A7E` フォルダと、`config/nxdiscord` フォルダを削除してください。
 
@@ -38,7 +39,7 @@ SDカードの中身はこうなります。
 
 | ログの内容 | 意味 |
 |---|---|
-| `main: start v1.0.0` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
+| `main: start v1.0.1` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
 | `network: 未接続` のまま | Wi-Fiにつながっていません |
 | `curl: global_init=0` 以外 | 通信ライブラリの初期化失敗 |
 | `postJson` / `postShot` の `http 200〜204` | 送信成功 |
