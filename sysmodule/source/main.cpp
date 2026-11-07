@@ -1,4 +1,4 @@
-// NXDiscord sysmodule (PC不要版)
+// NXShot 常駐版 sysmodule (PC不要版)
 // ・Switch単体で、DiscordのWebhookへ直接HTTPS送信する
 //   - ゲームの開始 / 終了(プレイ時間つき)の通知
 //   - SDカードのAlbumに増えた新しいスクリーンショット(jpg)と動画(mp4)の自動投稿
@@ -22,7 +22,7 @@
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
 #define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
-#define VERSION "1.1.2"
+#define VERSION "1.2.0"
 #define TRIM_TMP_PATH "sdmc:/config/nxdiscord/trim_tmp.mp4"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
@@ -130,11 +130,13 @@ void __appExit(void) {
 //     limit=10            送信できるファイルの上限(MB)
 //     trim=1              上限を超える動画の最初を削って送る(0で無効)
 //     album=sdmc:/...     Albumフォルダの場所(通常は書かない)
+//     auto=1              写真・動画の自動送信(0でオフ。ゲームの開始/終了の通知は続く)
 struct Config {
     std::string hook;
     std::string album;
     long limitMB = DEFAULT_LIMIT_MB;
     bool trim = true;
+    bool autoSend = true;
 };
 
 static std::string trimLine(const char *line) {
@@ -161,6 +163,8 @@ static bool loadConfig(Config &c) {
             if (v >= 1 && v <= 500) c.limitMB = v;
         } else if (t.compare(0, 5, "trim=") == 0) {
             c.trim = atol(trimLine(t.c_str() + 5).c_str()) != 0;
+        } else if (t.compare(0, 5, "auto=") == 0) {
+            c.autoSend = atol(trimLine(t.c_str() + 5).c_str()) != 0;
         } else if (t.compare(0, 6, "album=") == 0) {
             c.album = trimLine(t.c_str() + 6);
         } else if (c.album.empty() && t.compare(0, 6, "sdmc:/") == 0) {
@@ -432,6 +436,14 @@ static void checkScreenshots(const Config &cfg) {
     std::vector<std::string> names;
     if (!scanNewestDay(cfg.album, dayPath, names)) return;
 
+    if (!cfg.autoSend) {
+        // 自動送信オフ: 送らない。あとでオンにしたとき、オフの間に撮ったものが一気に送られないよう、印だけ進める
+        for (auto &n : names) if (n > g_lastSent) g_lastSent = n;
+        g_albumInit = true;
+        g_pendingName.clear();
+        return;
+    }
+
     if (!g_albumInit) {  // 起動時にすでにある写真は送らない
         for (auto &n : names) if (n > g_lastSent) g_lastSent = n;
         g_albumInit = true;
@@ -546,7 +558,7 @@ static std::string albumReport(const Config &cfg) {
         return "Albumを読めません。設定→データ管理→スクリーンショットと動画の管理→保存先がSDカードか確認してください。\n場所: " + cfg.album;
     int img = 0, vid = 0;
     for (auto &n : names) { if (mediaKind(n) == MK_VIDEO) vid++; else img++; }
-    return "Albumを読めました。最新の日の写真: " + std::to_string(img) + "枚 / 動画: " + std::to_string(vid) + "本\n送信できるファイルの上限: " + std::to_string(cfg.limitMB) + "MB";
+    return "Albumを読めました。最新の日の写真: " + std::to_string(img) + "枚 / 動画: " + std::to_string(vid) + "本\n送信できるファイルの上限: " + std::to_string(cfg.limitMB) + "MB\n写真・動画の自動送信: " + (cfg.autoSend ? "オン" : "オフ");
 }
 
 // ---- メイン ----
@@ -608,7 +620,7 @@ int main(int argc, char **argv) {
                 // 起動の確認。これがチャンネルに届けば、通信とWebhookは正常
                 std::string rep = albumReport(cfg);
                 nxlog("album: %s", rep.c_str());
-                long code = postJson(cfg.hook, embedJson("🟢 NXDiscord 起動", rep, 5763719));
+                long code = postJson(cfg.hook, embedJson("🟢 NXShot 起動", rep, 5763719));
                 nxlog("boot post: %ld", code);
                 if (isFinal(code)) bootDone = true;
             }
