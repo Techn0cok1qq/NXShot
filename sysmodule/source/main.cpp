@@ -2,6 +2,7 @@
 // ・Switch単体で、DiscordのWebhookへ直接HTTPS送信する
 //   - ゲームの開始 / 終了(プレイ時間つき)の通知
 //   - SDカードのAlbumに増えた新しいスクリーンショット(jpg)と動画(mp4)の自動投稿
+//     (動画が上限を超えるときは、最初のほうを削って収めて送る)
 // 依存: libnx + libcurl(switch-curl。HTTPSはlibnxのsslサービス経由)
 #include <switch.h>
 #include <curl/curl.h>
@@ -14,13 +15,15 @@
 #include <vector>
 #include <unistd.h>
 #include <cstdarg>
+#include "mp4trim.h"
 
 #define INNER_HEAP_SIZE 0x400000  // 4MB(TLS+アップロード用。2MBだと足りない恐れがある)
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
 #define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
-#define VERSION "1.1.1"
+#define VERSION "1.1.2"
+#define TRIM_TMP_PATH "sdmc:/config/nxdiscord/trim_tmp.mp4"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
 
@@ -125,11 +128,13 @@ void __appExit(void) {
 //   1行目: DiscordのWebhook URL(必須)
 //   2行目以降(省略可):
 //     limit=10            送信できるファイルの上限(MB)
+//     trim=1              上限を超える動画の最初を削って送る(0で無効)
 //     album=sdmc:/...     Albumフォルダの場所(通常は書かない)
 struct Config {
     std::string hook;
     std::string album;
     long limitMB = DEFAULT_LIMIT_MB;
+    bool trim = true;
 };
 
 static std::string trimLine(const char *line) {
@@ -154,6 +159,8 @@ static bool loadConfig(Config &c) {
         if (t.compare(0, 6, "limit=") == 0) {
             long v = atol(trimLine(t.c_str() + 6).c_str());
             if (v >= 1 && v <= 500) c.limitMB = v;
+        } else if (t.compare(0, 5, "trim=") == 0) {
+            c.trim = atol(trimLine(t.c_str() + 5).c_str()) != 0;
         } else if (t.compare(0, 6, "album=") == 0) {
             c.album = trimLine(t.c_str() + 6);
         } else if (c.album.empty() && t.compare(0, 6, "sdmc:/") == 0) {
@@ -439,18 +446,6 @@ static void checkScreenshots(const Config &cfg) {
     struct stat st;
     if (stat(full.c_str(), &st) != 0 || st.st_size <= 0) return;
     bool isVideo = mediaKind(next) == MK_VIDEO;
-    if ((long long)st.st_size + 65536 > (long long)cfg.limitMB * 1048576LL) {
-        // 上限を超えるファイルは送れない。撮ったことだけ通知する
-        char msg[256];
-        snprintf(msg, sizeof(msg), "ファイルが大きいため送れませんでした(%.1fMB / 上限%ldMB)。config.txtのlimit=で上限を変えられます。",
-                 st.st_size / 1048576.0, cfg.limitMB);
-        nxlog("media: 上限超え %s (%lld bytes, limit=%ldMB)", next.c_str(), (long long)st.st_size, cfg.limitMB);
-        std::string d = g_curTitle.empty() ? std::string(msg) : g_curTitle + "\n" + msg;
-        enqueue(embedJson(isVideo ? "🎬 動画(未送信)" : "📸 スクリーンショット(未送信)", d, 10070709));
-        g_lastSent = next;
-        g_pendingName.clear();
-        return;
-    }
 
     // 書き込み中に送らないよう、前回とサイズが同じになってから送る
     if (g_pendingName != next || g_pendingSize != (long)st.st_size) {
@@ -459,17 +454,60 @@ static void checkScreenshots(const Config &cfg) {
         return;
     }
 
+    std::string sendPath = full;
+    std::string note;        // 説明欄に足す文
+    bool trimmed = false;
+    long long limitBytes = (long long)cfg.limitMB * 1048576LL - 65536;
+    if ((long long)st.st_size > limitBytes) {
+        // 上限を超えている。動画なら、最初のほうを削って収められないか試す
+        mp4trim::Info ti;
+        mp4trim::Result tr = mp4trim::ERR_FORMAT;
+        if (isVideo && cfg.trim) {
+            nxlog("trim: 開始 %s (%lld bytes, 上限 %lld)", next.c_str(), (long long)st.st_size, limitBytes);
+            tr = mp4trim::trim(full.c_str(), TRIM_TMP_PATH, limitBytes, &ti);
+            nxlog("trim: result=%d new=%lld cut=%.2fs", (int)tr, (long long)ti.newSize, ti.cutSeconds);
+        }
+        if (tr == mp4trim::OK) {
+            sendPath = TRIM_TMP_PATH;
+            trimmed = true;
+            char nb[200];
+            snprintf(nb, sizeof(nb), "容量の都合で、最初の%.1f秒を削って送りました(%.1fMB→%.1fMB)",
+                     ti.cutSeconds, ti.origSize / 1048576.0, ti.newSize / 1048576.0);
+            note = nb;
+        } else {
+            remove(TRIM_TMP_PATH);
+            char msg[300];
+            if (isVideo && cfg.trim)
+                snprintf(msg, sizeof(msg), "ファイルが大きいため送れませんでした(%.1fMB / 上限%ldMB)。削って収めることもできませんでした。",
+                         st.st_size / 1048576.0, cfg.limitMB);
+            else
+                snprintf(msg, sizeof(msg), "ファイルが大きいため送れませんでした(%.1fMB / 上限%ldMB)。config.txtのlimit=で上限を変えられます。",
+                         st.st_size / 1048576.0, cfg.limitMB);
+            nxlog("media: 上限超え %s (%lld bytes, limit=%ldMB)", next.c_str(), (long long)st.st_size, cfg.limitMB);
+            std::string d = g_curTitle.empty() ? std::string(msg) : g_curTitle + "\n" + msg;
+            enqueue(embedJson(isVideo ? "🎬 動画(未送信)" : "📸 スクリーンショット(未送信)", d, 10070709));
+            g_lastSent = next;
+            g_pendingName.clear();
+            return;
+        }
+    }
+
     std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" +
                           (isVideo ? "🎬 動画" : "📸 スクリーンショット") + "\"";
-    if (!g_curTitle.empty()) payload += ",\"description\":\"" + jsonEscape(g_curTitle) + "\"";
+    std::string desc = g_curTitle;
+    if (!note.empty()) desc += (desc.empty() ? "" : "\n") + note;
+    if (!desc.empty()) payload += ",\"description\":\"" + jsonEscape(desc) + "\"";
     payload += ",\"color\":15277667";
     if (!isVideo) payload += ",\"image\":{\"url\":\"attachment://screenshot.jpg\"}";
     payload += "}]}";
 
     // 大きいファイルほど時間がかかるので、送信の制限時間を長めにする
-    long timeoutSec = 60 + (long)(st.st_size / 1048576) * 8;
-    long code = postShot(cfg.hook, payload, full, isVideo ? "video.mp4" : "screenshot.jpg",
+    struct stat sst;
+    long long sendSize = (stat(sendPath.c_str(), &sst) == 0) ? (long long)sst.st_size : (long long)st.st_size;
+    long timeoutSec = 60 + (long)(sendSize / 1048576) * 8;
+    long code = postShot(cfg.hook, payload, sendPath, isVideo ? "video.mp4" : "screenshot.jpg",
                          isVideo ? "video/mp4" : "image/jpeg", timeoutSec);
+    if (trimmed) remove(TRIM_TMP_PATH);  // 一時ファイルは必ず消す
     if (code >= 200 && code < 300) {
         g_lastSent = next;
         g_pendingName.clear();
@@ -514,6 +552,7 @@ static std::string albumReport(const Config &cfg) {
 // ---- メイン ----
 int main(int argc, char **argv) {
     nxlog("main: start v" VERSION);
+    remove(TRIM_TMP_PATH);  // 前回の一時ファイルが残っていたら消す
     bool cfgLogged = false;
     bool netLogged = false, lastNet = false;
 
