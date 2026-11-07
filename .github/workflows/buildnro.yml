@@ -1,4 +1,4 @@
-name: buildnro
+name: build
 
 on:
   push:
@@ -23,7 +23,10 @@ jobs:
         run: make -C sysmodule
 
       - name: アプリ用のライブラリを入れる
-        run: dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-curl
+        run: dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl
+
+      - name: 動画プレビュー用の ffmpeg を入れる(入らなくてもビルドは続く)
+        run: dkp-pacman -S --noconfirm switch-ffmpeg || echo "switch-ffmpeg なしでビルドします(動画のプレビューは使えません)"
 
       - name: アプリ(nro)をビルド
         run: make -C app
@@ -33,20 +36,20 @@ jobs:
           D=pkg/atmosphere/contents/4200000000000A7E
           mkdir -p $D/flags pkg/config/nxdiscord
           cp sysmodule/out/nxdiscord.nsp $D/exefs.nsp
-          mkdir -p pkg/switch/NXDiscord
-          cp app/out/NXDiscord.nro pkg/switch/NXDiscord/NXDiscord.nro
+          mkdir -p pkg/switch/NXShot
+          cp app/out/NXShot.nro pkg/switch/NXShot/NXShot.nro
           touch $D/flags/boot2.flag
-          printf '[ここにWebhook URLを貼る]\nlimit=10\n' > pkg/config/nxdiscord/config.txt
+          printf '[ここにWebhook URLを貼る]\nlimit=10\nauto=1\n' > pkg/config/nxdiscord/config.txt
           cp README.md LICENSE CHANGELOG.md pkg/
-          (cd pkg && zip -qr ../NXDiscord-1.2.0.zip .)
+          (cd pkg && zip -qr ../NXShot-1.2.0.zip .)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NXDiscord-1.2.0
+          name: NXShot-1.2.0
           path: pkg
 
       - name: Releaseに添付する
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: NXDiscord-1.2.0.zip
+          files: NXShot-1.2.0.zip
