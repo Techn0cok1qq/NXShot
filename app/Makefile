@@ -1,7 +1,8 @@
 #---------------------------------------------------------------------------------
-# NXDiscord アプリ(.nro) Makefile (devkitPro / libnx)
-# 使い方: devkitPro環境で `make` → out/ に NXDiscord.nro ができる
-# 必要: switch-sdl2 switch-sdl2_ttf switch-curl (dkp-pacman -S で入れる)
+# NXShot アプリ(.nro) Makefile (devkitPro / libnx)
+# 使い方: devkitPro環境で `make` → out/ に NXShot.nro ができる
+# 必要: switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl (dkp-pacman -S で入れる)
+# あると良い: switch-ffmpeg (入っていれば、動画のサムネとプレビューが使える。無くてもビルドできる)
 #---------------------------------------------------------------------------------
 .SUFFIXES:
 
@@ -12,26 +13,40 @@ endif
 TOPDIR ?= $(CURDIR)
 include $(DEVKITPRO)/libnx/switch_rules
 
-TARGET   := NXDiscord
+TARGET   := NXShot
 BUILD    := build
 SOURCES  := source
 OUT      := out
 
-APP_TITLE   := NXDiscord
-APP_AUTHOR  := Techn0cok1qq
-APP_VERSION := 1.0.0
+APP_TITLE   := NXShot
+APP_AUTHOR  := Cokacolastic
+APP_VERSION := 1.2.0
 
 PKGCONF  := $(DEVKITPRO)/portlibs/switch/bin/aarch64-none-elf-pkg-config
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 
-# SDL2 / SDL2_ttf / libcurl の設定。pkg-configで取れなければ既定の値を使う
-PKG_CFLAGS := $(shell $(PKGCONF) --cflags sdl2 SDL2_ttf libcurl 2>/dev/null)
+# SDL2 / SDL2_ttf / SDL2_image / libcurl の設定。pkg-configで取れなければ既定の値を使う
+PKG_MODS := sdl2 SDL2_ttf SDL2_image libcurl
+PKG_CFLAGS := $(shell $(PKGCONF) --cflags $(PKG_MODS) 2>/dev/null)
 ifeq ($(strip $(PKG_CFLAGS)),)
 PKG_CFLAGS := -I$(DEVKITPRO)/portlibs/switch/include/SDL2 -D_REENTRANT
 endif
-PKG_LIBS := $(shell $(PKGCONF) --libs --static sdl2 SDL2_ttf libcurl 2>/dev/null)
+
+# ffmpeg(switch-ffmpeg)が入っていれば、動画のサムネ・プレビューを有効にする
+FF_MODS := libavformat libavcodec libswscale libavutil
+ifneq ($(strip $(shell $(PKGCONF) --exists $(FF_MODS) 2>/dev/null && echo yes)),)
+PKG_MODS += $(FF_MODS)
+PKG_CFLAGS += -DNXSHOT_FFMPEG
+endif
+
+PKG_LIBS := $(shell $(PKGCONF) --libs --static $(PKG_MODS) 2>/dev/null)
 ifeq ($(strip $(PKG_LIBS)),)
-PKG_LIBS := -lSDL2_ttf -lfreetype -lbz2 -lpng16 -lz -lSDL2 -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lcurl -lmbedtls -lmbedx509 -lmbedcrypto
+PKG_LIBS := -lSDL2_ttf -lSDL2_image -lfreetype -lbz2 -ljpeg -lpng16 -lz -lSDL2 -lEGL -lGLESv2 -lglapi -ldrm_nouveau -lcurl -lmbedtls -lmbedx509 -lmbedcrypto
+endif
+
+# pkg-configの結果にSDL2_imageが入っていない場合でも、IMG_Load等がリンクできるように補う
+ifeq ($(findstring SDL2_image,$(PKG_LIBS)),)
+PKG_LIBS := -lSDL2_image -ljpeg -lpng16 -lz $(PKG_LIBS)
 endif
 
 CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) $(INCLUDE) -D__SWITCH__ $(PKG_CFLAGS)
@@ -51,7 +66,7 @@ export OFILES   := $(CPPFILES:.cpp=.o)
 export LD       := $(CXX)
 export INCLUDE  := $(foreach dir,$(LIBDIRS),-I$(dir)/include) -I$(CURDIR)/$(BUILD)
 export LIBPATHS := $(foreach dir,$(LIBDIRS),-L$(dir)/lib)
-export NROFLAGS += --nacp=$(OUTPUT).nacp --icon=$(LIBNX)/default_icon.jpg
+export NROFLAGS += --nacp=$(OUTPUT).nacp --icon=$(CURDIR)/icon.jpg
 
 .PHONY: all clean
 
