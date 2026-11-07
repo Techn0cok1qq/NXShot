@@ -20,7 +20,7 @@
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
 #define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
-#define VERSION "1.1.0"
+#define VERSION "1.1.1"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
 
@@ -363,6 +363,8 @@ static void flushQueue(const Config &cfg) {
 static std::string g_lastSent;
 static bool g_albumInit = false;
 static std::string g_pendingName;
+static std::string g_failName;  // 送信に失敗したファイル
+static int g_failCount = 0;
 static long g_pendingSize = -1;
 
 enum { MK_NONE = 0, MK_IMAGE = 1, MK_VIDEO = 2 };
@@ -468,9 +470,34 @@ static void checkScreenshots(const Config &cfg) {
     long timeoutSec = 60 + (long)(st.st_size / 1048576) * 8;
     long code = postShot(cfg.hook, payload, full, isVideo ? "video.mp4" : "screenshot.jpg",
                          isVideo ? "video/mp4" : "image/jpeg", timeoutSec);
-    if (isFinal(code)) {
+    if (code >= 200 && code < 300) {
         g_lastSent = next;
         g_pendingName.clear();
+        g_failName.clear();
+        g_failCount = 0;
+        return;
+    }
+
+    // 失敗。サーバーに断られた(4xx)なら再送しても無駄。通信エラー等は3回までやり直す
+    bool refused = code >= 400 && code < 500 && code != 429;
+    if (g_failName != next) { g_failName = next; g_failCount = 0; }
+    g_failCount++;
+    if (refused || g_failCount >= 3) {
+        char msg[320];
+        if (code == 413)
+            snprintf(msg, sizeof(msg), "Discordのサーバーの上限を超えていて送れませんでした(%.1fMB)。config.txtのlimit=を小さくすると、この通知だけで済みます。",
+                     st.st_size / 1048576.0);
+        else if (code > 0)
+            snprintf(msg, sizeof(msg), "送信に失敗しました(http %ld, %.1fMB)。", code, st.st_size / 1048576.0);
+        else
+            snprintf(msg, sizeof(msg), "通信に失敗したため送れませんでした(%.1fMB)。", st.st_size / 1048576.0);
+        nxlog("media: 送信をあきらめました %s (http %ld)", next.c_str(), code);
+        std::string d = g_curTitle.empty() ? std::string(msg) : g_curTitle + "\n" + msg;
+        enqueue(embedJson(isVideo ? "🎬 動画(送信失敗)" : "📸 スクリーンショット(送信失敗)", d, 10038562));
+        g_lastSent = next;
+        g_pendingName.clear();
+        g_failName.clear();
+        g_failCount = 0;
     }
 }
 
