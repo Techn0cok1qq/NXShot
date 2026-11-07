@@ -28,17 +28,17 @@ jobs:
           mkdir -p $D/flags pkg/config/nxdiscord
           cp sysmodule/out/nxdiscord.nsp $D/exefs.nsp
           touch $D/flags/boot2.flag
-          printf '[ここにWebhook URLを貼る]\nlimit=10\n' > pkg/config/nxdiscord/config.txt
+          printf '[ここにWebhook URLを貼る]\nlimit=20\n' > pkg/config/nxdiscord/config.txt
           cp README.md LICENSE CHANGELOG.md pkg/
-          (cd pkg && zip -qr ../NXDiscord-1.1.0.zip .)
+          (cd pkg && zip -qr ../NXDiscord-1.1.1.zip .)
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NXDiscord-1.1.0
+          name: NXDiscord-1.1.1
           path: pkg
 
       - name: Releaseに添付する
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: NXDiscord-1.1.0.zip
+          files: NXDiscord-1.1.1.zip
