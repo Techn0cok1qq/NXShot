@@ -7,6 +7,10 @@
 //   2. 候補ごとに「mdatの切り始め位置〜末尾をそのままコピーした場合の大きさ」を計算
 //   3. 上限に収まる一番古い候補を選び、ftyp + 新しいmdat + 新しいmoov を書き出す
 //   サンプルのオフセットは全部「一定の差」だけずれる。チャンク表は「1サンプル=1チャンク」に作り直す。
+//
+// もう1つの機能: cutRange() は「最初(秒)〜最後(秒)」を指定して切り出す(再エンコードなし)。
+//   開始はキーフレームに切り下げる(指定より少し早くなる)。終了は、そのコマの手前まで(B-frameが無いので、どこでも切れる)。
+//   probe() は、長さとキーフレームの時刻を返す(切り取り画面で使う)。
 #pragma once
 #include <cstdio>
 #include <cstdint>
@@ -24,7 +28,8 @@ enum Result {
     ERR_FORMAT = -2,    // mp4の構造が想定外(未対応)
     ERR_TOO_BIG = -3,   // 削っても収まらない(残りが短すぎる)
     ERR_WRITE = -4,     // 書き込み失敗
-    ERR_MEMORY = -5
+    ERR_MEMORY = -5,
+    ERR_RANGE = -6      // 切り出す範囲が正しくない(短すぎる、など)
 };
 
 struct Info {
@@ -229,23 +234,25 @@ struct Plan {
     double T = 0;
 };
 
-static void buildNewTrack(const Track &t, size_t first, int64_t cutOffset, int64_t newDataStart, NewTrack &n) {
+static void buildNewTrack(const Track &t, size_t first, size_t last, int64_t cutOffset, int64_t newDataStart, NewTrack &n) {
     size_t count = t.size.size();
-    size_t keep = count - first;
+    if (last > count) last = count;
+    if (first > last) first = last;
+    size_t keep = last - first;
     // stsz
     wr32(n.stsz, 0); wr32(n.stsz, 0); wr32(n.stsz, (uint32_t)keep);
-    for (size_t i = first; i < count; i++) wr32(n.stsz, t.size[i]);
+    for (size_t i = first; i < last; i++) wr32(n.stsz, t.size[i]);
     // stco(1サンプル=1チャンク)
     wr32(n.stco, 0); wr32(n.stco, (uint32_t)keep);
-    for (size_t i = first; i < count; i++) wr32(n.stco, (uint32_t)((int64_t)t.off[i] - cutOffset + newDataStart));
+    for (size_t i = first; i < last; i++) wr32(n.stco, (uint32_t)((int64_t)t.off[i] - cutOffset + newDataStart));
     // stsc
     wr32(n.stsc, 0); wr32(n.stsc, 1); wr32(n.stsc, 1); wr32(n.stsc, 1); wr32(n.stsc, 1);
     // stts(同じ長さをまとめる)
     Bytes runs;
     uint32_t nruns = 0;
-    for (size_t i = first; i < count;) {
+    for (size_t i = first; i < last;) {
         size_t j = i;
-        while (j < count && t.dur[j] == t.dur[i]) j++;
+        while (j < last && t.dur[j] == t.dur[i]) j++;
         wr32(runs, (uint32_t)(j - i)); wr32(runs, t.dur[i]);
         nruns++;
         i = j;
@@ -256,12 +263,12 @@ static void buildNewTrack(const Track &t, size_t first, int64_t cutOffset, int64
     if (t.hasStss) {
         Bytes ss;
         uint32_t ns = 0;
-        for (size_t i = first; i < count; i++) if (t.sync[i]) { wr32(ss, (uint32_t)(i - first + 1)); ns++; }
+        for (size_t i = first; i < last; i++) if (t.sync[i]) { wr32(ss, (uint32_t)(i - first + 1)); ns++; }
         wr32(n.stss, 0); wr32(n.stss, ns);
         n.stss.insert(n.stss.end(), ss.begin(), ss.end());
     }
     uint64_t md = 0;
-    for (size_t i = first; i < count; i++) md += t.dur[i];
+    for (size_t i = first; i < last; i++) md += t.dur[i];
     n.mediaDur = md;
 }
 
@@ -431,7 +438,7 @@ static inline Result trim(const char *inPath, const char *outPath, int64_t maxBy
         std::vector<NewTrack> nts(tracks.size());
         uint64_t movieDur = 0;
         for (size_t k = 0; k < tracks.size(); k++) {
-            buildNewTrack(tracks[k], B.plan.first[k], cut, newDataStart, nts[k]);
+            buildNewTrack(tracks[k], B.plan.first[k], tracks[k].size.size(), cut, newDataStart, nts[k]);
             uint64_t d = (uint64_t)((double)nts[k].mediaDur * movieTimescale / tracks[k].timescale + 0.5);
             movieDur = std::max(movieDur, d);
         }
@@ -486,6 +493,170 @@ static inline Result trim(const char *inPath, const char *outPath, int64_t maxBy
     if (fwrite(best.moov.data(), 1, best.moov.size(), o) != best.moov.size()) return ERR_WRITE;
     if (fflush(o) != 0) return ERR_WRITE;
     I.newSize = best.total;
+    return OK;
+}
+
+// ---- 以下: 範囲を指定して切り出す ----
+namespace detail {
+
+struct Loaded {
+    Layout L;
+    Bytes moov;
+    std::vector<Box> top;       // top[0] が moov
+    uint32_t movieTimescale = 0;
+    std::vector<Track> tracks;
+    int vtrack = -1;
+    int64_t fileSize = 0;
+    const Box &moovBox() const { return top[0]; }
+};
+
+static Result loadAll(FILE *f, Loaded &D) {
+    if (fseeko(f, 0, SEEK_END) != 0) return ERR_OPEN;
+    D.fileSize = (int64_t)ftello(f);
+    if (!scanTop(f, D.fileSize, D.L)) return ERR_FORMAT;
+    if (D.L.moovSize > 4 * 1024 * 1024) return ERR_FORMAT;
+    D.moov.resize((size_t)D.L.moovSize);
+    if (!fread_at(f, D.L.moovOff, D.moov.data(), D.moov.size())) return ERR_OPEN;
+    if (!parseBoxes(D.moov.data(), D.moov.size(), D.top, 0) || D.top.size() != 1 || D.top[0].type != fourcc("moov")) return ERR_FORMAT;
+    const Box *mvhd = findKid(D.top[0], "mvhd");
+    if (!mvhd || mvhd->payload.size() < 20) return ERR_FORMAT;
+    D.movieTimescale = (mvhd->payload[0] == 1) ? rd32(&mvhd->payload[20]) : rd32(&mvhd->payload[12]);
+    if (D.movieTimescale == 0) return ERR_FORMAT;
+    for (auto &k : D.top[0].kids) {
+        if (k.type != fourcc("trak")) continue;
+        Track t;
+        if (!loadTrack(k, t)) return ERR_FORMAT;
+        D.tracks.push_back(std::move(t));
+    }
+    for (size_t i = 0; i < D.tracks.size(); i++) if (D.tracks[i].handler == fourcc("vide")) { D.vtrack = (int)i; break; }
+    if (D.vtrack < 0 || D.tracks[D.vtrack].size.empty()) return ERR_FORMAT;
+    for (auto &t : D.tracks) {
+        for (size_t i = 0; i < t.off.size(); i++)
+            if ((int64_t)t.off[i] < D.L.mdatOff + D.L.mdatHdr || (int64_t)(t.off[i] + t.size[i]) > D.L.mdatOff + D.L.mdatSize) return ERR_FORMAT;
+    }
+    const Track &vt = D.tracks[D.vtrack];
+    bool anySync = false;
+    for (size_t i = 0; i < vt.sync.size(); i++) if (vt.sync[i]) { anySync = true; break; }
+    if (!anySync || !vt.sync[0]) return ERR_FORMAT;
+    return OK;
+}
+
+}  // namespace detail
+
+struct Probe {
+    double duration = 0;              // 映像の長さ(秒)
+    std::vector<double> keyframes;    // キーフレームの時刻(秒)。先頭は0
+    int64_t size = 0;
+};
+
+static inline Result probe(const char *inPath, Probe &P) {
+    using namespace detail;
+    FILE *f = fopen(inPath, "rb");
+    if (!f) return ERR_OPEN;
+    struct Closer { FILE *f; ~Closer() { if (f) fclose(f); } } closer{f};
+    Loaded D;
+    Result r = loadAll(f, D);
+    if (r != OK) return r;
+    const Track &vt = D.tracks[D.vtrack];
+    P.size = D.fileSize;
+    P.duration = vt.totalSec;
+    P.keyframes.clear();
+    for (size_t i = 0; i < vt.sync.size(); i++) if (vt.sync[i]) P.keyframes.push_back(vt.startSec[i]);
+    return OK;
+}
+
+struct RangeInfo {
+    int64_t origSize = 0, newSize = 0;
+    double start = 0, end = 0;   // 実際に切り出す範囲(開始はキーフレームに切り下げ済み)
+};
+
+// startSec〜endSec を切り出して outPath に書く。dryRun のときは書かず、大きさと範囲だけ返す。
+static inline Result cutRange(const char *inPath, const char *outPath, double startSec, double endSec, RangeInfo *info = nullptr,
+                              bool dryRun = false) {
+    using namespace detail;
+    RangeInfo local;
+    RangeInfo &I = info ? *info : local;
+    FILE *f = fopen(inPath, "rb");
+    if (!f) return ERR_OPEN;
+    struct Closer { FILE *f; ~Closer() { if (f) fclose(f); } } closer{f};
+    Loaded D;
+    Result lr = loadAll(f, D);
+    if (lr != OK) return lr;
+    I.origSize = D.fileSize;
+    const std::vector<Track> &tracks = D.tracks;
+    const Track &vt = tracks[D.vtrack];
+
+    if (startSec < 0) startSec = 0;
+    if (endSec > vt.totalSec) endSec = vt.totalSec;
+    // 開始: 指定より前(同じ)で一番近いキーフレーム
+    size_t vf = 0;
+    for (size_t i = 0; i < vt.sync.size(); i++) {
+        if (!vt.sync[i]) continue;
+        if (vt.startSec[i] <= startSec + 1e-6) vf = i; else break;
+    }
+    double T = vt.startSec[vf];
+    // 終了: 時刻 endSec 以降で最初のコマの手前まで
+    size_t vlast = firstAtOrAfter(vt, endSec);
+    if (vlast <= vf + 1) return ERR_RANGE;
+    double E = vlast >= vt.startSec.size() ? vt.totalSec : vt.startSec[vlast];
+    if (E - T < 0.2) return ERR_RANGE;
+
+    size_t nT = tracks.size();
+    std::vector<size_t> first(nT), last(nT);
+    int64_t cut = INT64_MAX, endOff = 0;
+    for (size_t k = 0; k < nT; k++) {
+        if ((int)k == D.vtrack) { first[k] = vf; last[k] = vlast; }
+        else {
+            first[k] = firstAtOrAfter(tracks[k], T);
+            last[k] = firstAtOrAfter(tracks[k], E);
+            if (last[k] < first[k]) last[k] = first[k];
+        }
+        if (last[k] > first[k]) {
+            cut = std::min<int64_t>(cut, (int64_t)tracks[k].off[first[k]]);
+            endOff = std::max<int64_t>(endOff, (int64_t)(tracks[k].off[last[k] - 1] + tracks[k].size[last[k] - 1]));
+        }
+    }
+    if (cut == INT64_MAX || endOff <= cut) return ERR_RANGE;
+
+    const int64_t newDataStart = D.L.ftypSize + 8;
+    std::vector<NewTrack> nts(nT);
+    uint64_t movieDur = 0;
+    for (size_t k = 0; k < nT; k++) {
+        buildNewTrack(tracks[k], first[k], last[k], cut, newDataStart, nts[k]);
+        uint64_t d = (uint64_t)((double)nts[k].mediaDur * D.movieTimescale / tracks[k].timescale + 0.5);
+        movieDur = std::max(movieDur, d);
+    }
+    Ctx cx{&tracks, &nts, D.movieTimescale, movieDur, 0};
+    Bytes moovOut;
+    serialize(D.moovBox(), moovOut, cx, -1, 0);
+    int64_t dataLen = endOff - cut;
+    if (dataLen + 8 > 0xFFFFFFFFLL) return ERR_TOO_BIG;
+    I.newSize = newDataStart + dataLen + (int64_t)moovOut.size();
+    I.start = T;
+    I.end = E;
+    if (dryRun) return OK;
+
+    FILE *o = fopen(outPath, "wb");
+    if (!o) return ERR_WRITE;
+    struct OCloser { FILE *f; ~OCloser() { if (f) fclose(f); } } ocl{o};
+    Bytes ftyp((size_t)D.L.ftypSize);
+    if (!fread_at(f, D.L.ftypOff, ftyp.data(), ftyp.size())) return ERR_OPEN;
+    if (fwrite(ftyp.data(), 1, ftyp.size(), o) != ftyp.size()) return ERR_WRITE;
+    uint8_t mh[8];
+    put32(mh, (uint32_t)(dataLen + 8));
+    put32(mh + 4, fourcc("mdat"));
+    if (fwrite(mh, 1, 8, o) != 8) return ERR_WRITE;
+    if (fseeko(f, (off_t)cut, SEEK_SET) != 0) return ERR_OPEN;
+    static uint8_t buf[64 * 1024];
+    int64_t left = dataLen;
+    while (left > 0) {
+        size_t n = (size_t)std::min<int64_t>(left, (int64_t)sizeof(buf));
+        if (fread(buf, 1, n, f) != n) return ERR_OPEN;
+        if (fwrite(buf, 1, n, o) != n) return ERR_WRITE;
+        left -= (int64_t)n;
+    }
+    if (fwrite(moovOut.data(), 1, moovOut.size(), o) != moovOut.size()) return ERR_WRITE;
+    if (fflush(o) != 0) return ERR_WRITE;
     return OK;
 }
 
