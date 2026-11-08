@@ -33,6 +33,7 @@ extern "C" {
 #endif
 #include "../../sysmodule/source/mp4trim.h"
 #include "imgops.h"
+#include "pngsave.h"
 
 #define APP_VERSION_STR "1.3.0"
 #define CONFIG_DIR "sdmc:/config/nxdiscord"
@@ -1350,23 +1351,14 @@ static bool imgFromFile(const std::string &path, imgops::Img &im) {
     return ok;
 }
 
-// 画像をjpgで保存する(だめならpng)。basePath は拡張子なし。保存できたら、実際のファイル名を outPath に入れる
+// 画像をpngで保存する。basePath は拡張子なし。保存できたら、実際のファイル名を outPath に入れる
+// (SDL2_imageの保存機能は、実機で落ちたので使わない。zlibだけで書く)
 static bool imgSave(const imgops::Img &im, const std::string &basePath, std::string &outPath) {
-    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, im.w, im.h, 24, SDL_PIXELFORMAT_RGB24);
-    if (!s) return false;
-    for (int y = 0; y < im.h; y++) {
-        unsigned char *d = (unsigned char *)s->pixels + (size_t)y * s->pitch;
-        const unsigned char *r = im.at(0, y);
-        for (int x = 0; x < im.w; x++) { d[x * 3] = r[x * 4]; d[x * 3 + 1] = r[x * 4 + 1]; d[x * 3 + 2] = r[x * 4 + 2]; }
-    }
-    bool ok = false;
-    std::string jp = basePath + ".jpg";
-    if (IMG_SaveJPG(s, jp.c_str(), 92) == 0) { outPath = jp; ok = true; }
-    else {
-        std::string pn = basePath + ".png";
-        if (IMG_SavePNG(s, pn.c_str()) == 0) { outPath = pn; ok = true; }
-    }
-    SDL_FreeSurface(s);
+    std::string pn = basePath + ".png";
+    applog("imgSave: 開始 %dx%d -> %s", im.w, im.h, pn.c_str());
+    bool ok = pngsave::saveRGBA(pn.c_str(), im.px.data(), im.w, im.h);
+    applog("imgSave: 結果=%d", ok ? 1 : 0);
+    if (ok) outPath = pn;
     return ok;
 }
 
