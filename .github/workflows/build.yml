@@ -35,7 +35,21 @@ jobs:
           exit 1
 
       - name: 動画プレビュー用の ffmpeg を入れる(入らなくてもビルドは続く)
-        run: dkp-pacman -S --noconfirm switch-ffmpeg || echo "switch-ffmpeg なしでビルドします(動画のプレビューは使えません)"
+        run: |
+          # 入らなかった理由が分かるように、メッセージはそのまま表示する。403のときはリトライする
+          dkp-pacman -Ss ffmpeg || true
+          ok=0
+          for i in 1 2 3 4 5; do
+            if dkp-pacman -Syu --noconfirm switch-ffmpeg; then ok=1; break; fi
+            echo "ffmpegの取得に失敗($i/5)。$((i*20))秒待って再試行します"
+            sleep $((i*20))
+          done
+          if [ "$ok" = 1 ]; then
+            echo "switch-ffmpeg: インストール成功"
+            ls /opt/devkitpro/portlibs/switch/lib/pkgconfig | grep -i "libav\|libsw" || true
+          else
+            echo "::warning::switch-ffmpeg が入りませんでした。動画のプレビューなしでビルドします"
+          fi
 
       - name: アプリ(nro)をビルド
         run: |
