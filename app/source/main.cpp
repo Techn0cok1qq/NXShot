@@ -33,7 +33,7 @@ extern "C" {
 #endif
 #include "../../sysmodule/source/mp4trim.h"
 
-#define APP_VERSION_STR "1.2.0"
+#define APP_VERSION_STR "1.2.1"
 #define CONFIG_DIR "sdmc:/config/nxdiscord"
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define SYS_LOG_PATH "sdmc:/config/nxdiscord/log.txt"
@@ -44,6 +44,11 @@ extern "C" {
 #define DEFAULT_LIMIT_MB 10
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
 #define SYS_TITLE_ID 0x4200000000000A7EULL
+#define SYS_NSP_PATH "sdmc:/atmosphere/contents/4200000000000A7E/exefs.nsp"
+#define SELF_DEFAULT_PATH "sdmc:/switch/NXShot/NXShot.nro"
+#define UPDATE_REPO "Techn0cok1qq/NXShot"   // アップデートの取得元(GitHub Releases)
+#define UPDATE_NRO_NAME "NXShot.nro"        // Releaseに付いているアプリ本体
+#define UPDATE_NSP_NAME "nxdiscord.nsp"     // Releaseに付いている常駐版
 
 // ====================================================================
 // ログ(アプリ自身の動作記録。Webhook URLは書かない)
@@ -75,6 +80,7 @@ struct Config {
     long limitMB = DEFAULT_LIMIT_MB;
     bool trim = true;
     bool autoSend = true;  // 常駐版が写真・動画を自動で送るか(auto=1/0)
+    bool updCheck = true;  // 起動時にアップデートを確認するか(updcheck=1/0)
 };
 static Config g_cfg;
 
@@ -105,6 +111,8 @@ static void loadConfig() {
             g_cfg.trim = atol(trimLine(t.c_str() + 5).c_str()) != 0;
         } else if (t.compare(0, 5, "auto=") == 0) {
             g_cfg.autoSend = atol(trimLine(t.c_str() + 5).c_str()) != 0;
+        } else if (t.compare(0, 9, "updcheck=") == 0) {
+            g_cfg.updCheck = atol(trimLine(t.c_str() + 9).c_str()) != 0;
         } else if (t.compare(0, 6, "album=") == 0) {
             album = trimLine(t.c_str() + 6);
         } else if (album.empty() && t.compare(0, 6, "sdmc:/") == 0) {
@@ -127,6 +135,7 @@ static bool saveConfig() {
     fprintf(f, "limit=%ld\n", g_cfg.limitMB);
     fprintf(f, "trim=%d\n", g_cfg.trim ? 1 : 0);
     fprintf(f, "auto=%d\n", g_cfg.autoSend ? 1 : 0);
+    fprintf(f, "updcheck=%d\n", g_cfg.updCheck ? 1 : 0);
     if (g_cfg.album != DEFAULT_ALBUM) fprintf(f, "album=%s\n", g_cfg.album.c_str());
     fclose(f);
     return true;
@@ -176,13 +185,18 @@ struct Tex { SDL_Texture *t; int w, h; };
 static std::unordered_map<std::string, Tex> g_texCache;
 
 static const SDL_Color C_BG = {20, 21, 28, 255};
-static const SDL_Color C_BAR = {32, 34, 46, 255};
-static const SDL_Color C_TEXT = {235, 237, 245, 255};
-static const SDL_Color C_DIM = {150, 155, 175, 255};
+static const SDL_Color C_BAR = {26, 28, 40, 255};
+static const SDL_Color C_CARD = {34, 37, 54, 255};
+static const SDL_Color C_CARD2 = {46, 50, 74, 255};
+static const SDL_Color C_TEXT = {236, 238, 247, 255};
+static const SDL_Color C_DIM = {146, 152, 176, 255};
 static const SDL_Color C_ACC = {88, 101, 242, 255};
+static const SDL_Color C_ACC2 = {140, 150, 255, 255};
 static const SDL_Color C_OK = {87, 242, 135, 255};
-static const SDL_Color C_NG = {237, 66, 69, 255};
-static const SDL_Color C_WARN = {254, 231, 92, 255};
+static const SDL_Color C_NG = {240, 82, 90, 255};
+static const SDL_Color C_WARN = {254, 218, 92, 255};
+static const SDL_Color C_WHITE = {255, 255, 255, 255};
+static SDL_Texture *g_bg = nullptr;  // 背景のグラデーション
 
 static void fillRect(int x, int y, int w, int h, SDL_Color c) {
     SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
@@ -194,6 +208,137 @@ static void frameRect(int x, int y, int w, int h, SDL_Color c) {
     SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
     SDL_Rect r = {x, y, w, h};
     SDL_RenderDrawRect(g_ren, &r);
+}
+
+// ---- 角丸の四角・三角・太い線(SDLの基本の描画だけで作る) ----
+// 角丸の四角で、row行目(0〜h-1)の左右が、角の丸みでどれだけ内側に寄るか
+static int rrInset(int row, int h, int r) {
+    int rr = row < h - 1 - row ? row : h - 1 - row;
+    if (r <= 0 || rr >= r) return 0;
+    double dy = r - (rr + 0.5);
+    double dx = std::sqrt((double)r * r - dy * dy);
+    int ins = (int)std::lround(r - dx);
+    return ins < 0 ? 0 : ins;
+}
+
+static void fillRRect(int x, int y, int w, int h, int r, SDL_Color c) {
+    if (w <= 0 || h <= 0) return;
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
+    for (int row = 0; row < h; row++) {
+        if (row >= r && row < h - r) {
+            SDL_Rect m = {x, y + row, w, h - 2 * r};
+            SDL_RenderFillRect(g_ren, &m);
+            row = h - r - 1;
+            continue;
+        }
+        int ins = rrInset(row, h, r);
+        SDL_Rect s = {x + ins, y + row, w - 2 * ins, 1};
+        SDL_RenderFillRect(g_ren, &s);
+    }
+}
+
+// 角丸の枠線(中は塗らない。サムネの上にも重ねられる)
+static void strokeRRect(int x, int y, int w, int h, int r, int t, SDL_Color c) {
+    if (w <= 2 * t || h <= 2 * t) return;
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
+    int ri = r - t > 0 ? r - t : 0;
+    int ih = h - 2 * t;
+    for (int row = 0; row < h; row++) {
+        if (row >= r && row < h - r) {
+            int len = h - 2 * r;
+            SDL_Rect a = {x, y + row, t, len};
+            SDL_Rect b = {x + w - t, y + row, t, len};
+            SDL_RenderFillRect(g_ren, &a);
+            SDL_RenderFillRect(g_ren, &b);
+            row = h - r - 1;
+            continue;
+        }
+        int oi = rrInset(row, h, r);
+        if (row < t || row >= h - t) {
+            SDL_Rect s = {x + oi, y + row, w - 2 * oi, 1};
+            SDL_RenderFillRect(g_ren, &s);
+            continue;
+        }
+        int ii = t + rrInset(row - t, ih, ri);
+        if (ii < oi) ii = oi;
+        if (ii - oi <= 0) continue;
+        SDL_Rect a = {x + oi, y + row, ii - oi, 1};
+        SDL_Rect b = {x + w - ii, y + row, ii - oi, 1};
+        SDL_RenderFillRect(g_ren, &a);
+        SDL_RenderFillRect(g_ren, &b);
+    }
+}
+
+static void fillTri(int x0, int y0, int x1, int y1, int x2, int y2, SDL_Color c) {
+    SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
+    int xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    int miny = std::min(y0, std::min(y1, y2)), maxy = std::max(y0, std::max(y1, y2));
+    for (int y = miny; y <= maxy; y++) {
+        double lo = 1e9, hi = -1e9;
+        for (int i = 0; i < 3; i++) {
+            int j = (i + 1) % 3;
+            int ya = ys[i], yb = ys[j];
+            if (ya == yb) {
+                if (y == ya) {
+                    lo = std::min(lo, (double)std::min(xs[i], xs[j]));
+                    hi = std::max(hi, (double)std::max(xs[i], xs[j]));
+                }
+                continue;
+            }
+            if ((y < ya && y < yb) || (y > ya && y > yb)) continue;
+            double t = (double)(y - ya) / (double)(yb - ya);
+            double x = xs[i] + t * (xs[j] - xs[i]);
+            lo = std::min(lo, x);
+            hi = std::max(hi, x);
+        }
+        if (hi >= lo) SDL_RenderDrawLine(g_ren, (int)std::floor(lo), y, (int)std::ceil(hi), y);
+    }
+}
+
+static void thickLine(int x0, int y0, int x1, int y1, int t, SDL_Color c) {
+    SDL_SetRenderDrawColor(g_ren, c.r, c.g, c.b, c.a);
+    for (int dx = -(t / 2); dx <= t / 2; dx++)
+        for (int dy = -(t / 2); dy <= t / 2; dy++) SDL_RenderDrawLine(g_ren, x0 + dx, y0 + dy, x1 + dx, y1 + dy);
+}
+
+// 背景: 縦に暗くなるグラデーションに、右上と左下にうっすら色をのせる(小さい画像を引き伸ばして使う)
+static void makeBackground() {
+    const int W = 96, H = 54;
+    std::vector<unsigned char> px((size_t)W * H * 4);
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            double u = (double)x / (W - 1), v = (double)y / (H - 1);
+            double r = 27 - 13 * v, g = 29 - 14 * v, b = 43 - 21 * v;
+            double dx1 = (u - 0.88) * 1.78, dy1 = v;
+            double k1 = std::max(0.0, 1.0 - std::sqrt(dx1 * dx1 + dy1 * dy1) / 0.75);
+            k1 = k1 * k1 * 0.30;
+            r += (88 - r) * k1; g += (101 - g) * k1; b += (242 - b) * k1;
+            double dx2 = u * 1.78, dy2 = 1.0 - v;
+            double k2 = std::max(0.0, 1.0 - std::sqrt(dx2 * dx2 + dy2 * dy2) / 0.7);
+            k2 = k2 * k2 * 0.16;
+            r += (170 - r) * k2; g += (70 - g) * k2; b += (200 - b) * k2;
+            unsigned char *q = &px[((size_t)y * W + x) * 4];
+            q[0] = (unsigned char)std::min(255.0, std::max(0.0, r));
+            q[1] = (unsigned char)std::min(255.0, std::max(0.0, g));
+            q[2] = (unsigned char)std::min(255.0, std::max(0.0, b));
+            q[3] = 255;
+        }
+    }
+    g_bg = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, W, H);
+    if (g_bg) SDL_UpdateTexture(g_bg, nullptr, px.data(), W * 4);
+}
+
+static void drawBackground() {
+    if (g_bg) {
+        SDL_RenderCopy(g_ren, g_bg, nullptr, nullptr);
+    } else {
+        SDL_SetRenderDrawColor(g_ren, C_BG.r, C_BG.g, C_BG.b, 255);
+        SDL_RenderClear(g_ren);
+    }
 }
 
 // 幅に収まるよう、末尾を「…」で省く(UTF-8の文字の途中では切らない)
@@ -294,23 +439,83 @@ static bool pressed(int b) { return g_press[b]; }
 
 static void beginFrame() {
     updateInput();
-    SDL_SetRenderDrawColor(g_ren, C_BG.r, C_BG.g, C_BG.b, 255);
-    SDL_RenderClear(g_ren);
+    drawBackground();
 }
 
 static void endFrame() {
     SDL_RenderPresent(g_ren);
 }
 
-static void drawHeader(const std::string &sub) {
-    fillRect(0, 0, 1280, 88, C_BAR);
-    drawText(48, 20, "NXShot", fTitle, C_TEXT);
-    drawText(1232, 34, sub, fBody, C_DIM, 1);
+static int textW(TTF_Font *f, const std::string &s) {
+    int w = 0, h = 0;
+    if (!f || TTF_SizeUTF8(f, s.c_str(), &w, &h) != 0) return 0;
+    return w;
 }
 
+// y を「文字の縦の真ん中」で指定して描く
+static void drawTextMid(int x, int cy, const std::string &s, TTF_Font *f, SDL_Color c, int align = 0) {
+    if (!f) return;
+    drawText(x, cy - TTF_FontHeight(f) / 2, s, f, c, align);
+}
+
+static void drawCard(int x, int y, int w, int h) {
+    fillRRect(x, y, w, h, 12, SDL_Color{34, 37, 54, 215});
+    strokeRRect(x, y, w, h, 12, 1, SDL_Color{255, 255, 255, 24});
+}
+
+static void drawProgress(int x, int y, int w, int h, double frac) {
+    fillRRect(x, y, w, h, h / 2, SDL_Color{255, 255, 255, 30});
+    if (frac <= 0) return;
+    int fw = (int)(w * std::min(1.0, frac));
+    if (fw < h) fw = h;
+    fillRRect(x, y, fw, h, h / 2, C_ACC);
+}
+
+static void drawHeader(const std::string &sub) {
+    fillRect(0, 0, 1280, 72, SDL_Color{16, 17, 26, 215});
+    fillRect(0, 72, 1280, 2, SDL_Color{88, 101, 242, 110});
+    fillRRect(36, 15, 42, 42, 11, C_ACC);
+    drawTextMid(57, 36, "N", fTitle, C_WHITE, 2);
+    drawTextMid(94, 36, "NXShot", fTitle, C_TEXT);
+    drawTextMid(1244, 36, sub, fBody, C_DIM, 1);
+}
+
+// フッター: 「A: 決定」のような部分を、ボタンの形の札つきで並べる(2つ以上の空白で区切る)
 static void drawFooter(const std::string &hint) {
-    fillRect(0, 656, 1280, 64, C_BAR);
-    drawText(48, 674, hint, fSmall, C_DIM);
+    fillRect(0, 664, 1280, 56, SDL_Color{16, 17, 26, 225});
+    fillRect(0, 664, 1280, 1, SDL_Color{255, 255, 255, 28});
+    std::vector<std::string> segs;
+    std::string cur;
+    for (size_t i = 0; i < hint.size();) {
+        if (hint[i] == ' ' && i + 1 < hint.size() && hint[i + 1] == ' ') {
+            if (!cur.empty()) segs.push_back(cur);
+            cur.clear();
+            while (i < hint.size() && hint[i] == ' ') i++;
+        } else {
+            cur += hint[i++];
+        }
+    }
+    if (!cur.empty()) segs.push_back(cur);
+    int x = 36, cy = 692;
+    for (auto &seg : segs) {
+        if (x > 1220) break;
+        size_t p = seg.find(": ");
+        bool chip = p != std::string::npos && p <= 12 && seg.find('(') > p;
+        if (chip) {
+            std::string key = seg.substr(0, p), label = seg.substr(p + 2);
+            int kw = std::max(28, textW(fSmall, key) + 18);
+            fillRRect(x, cy - 13, kw, 26, 7, SDL_Color{70, 75, 104, 255});
+            drawTextMid(x + kw / 2, cy, key, fSmall, C_WHITE, 2);
+            x += kw + 8;
+            std::string lb = fitText(fSmall, label, 1244 - x);
+            drawTextMid(x, cy, lb, fSmall, C_TEXT);
+            x += textW(fSmall, lb) + 26;
+        } else {
+            std::string lb = fitText(fSmall, seg, 1244 - x);
+            drawTextMid(x, cy, lb, fSmall, C_DIM);
+            x += textW(fSmall, lb) + 26;
+        }
+    }
 }
 
 // ---- 簡単なメッセージ画面(Aで閉じる) ----
@@ -318,17 +523,31 @@ static void showMessage(const std::string &title, const std::vector<std::string>
     while (!g_quit && appletMainLoop()) {
         beginFrame();
         drawHeader("お知らせ");
-        drawText(80, 130, title, fTitle, good ? C_OK : C_WARN);
-        int y = 210;
+        int h = 96 + (int)lines.size() * 36 + 24;
+        if (h < 180) h = 180;
+        drawCard(36, 100, 1208, h);
+        SDL_Color tc = good ? C_OK : C_WARN;
+        fillRRect(64, 128, 8, 36, 4, tc);
+        drawText(88, 124, title, fTitle, tc);
+        int y = 188;
         for (auto &l : lines) {
-            drawText(80, y, fitText(fBody, l, 1120), fBody, C_TEXT);
-            y += 42;
+            drawText(88, y, fitText(fBody, l, 1120), fBody, C_TEXT);
+            y += 36;
         }
         drawFooter("A: 閉じる");
         endFrame();
         if (pressed(BT_A) || pressed(BT_B)) return;
         SDL_Delay(16);
     }
+}
+
+// 「〜しています...」の1枚画面(その場で1回だけ描く)
+static void drawStatusScreen(const std::string &sub, const std::string &msg) {
+    drawBackground();
+    drawHeader(sub);
+    drawCard(36, 100, 1208, 96);
+    drawTextMid(64, 148, fitText(fBody, msg, 1150), fBody, C_TEXT);
+    SDL_RenderPresent(g_ren);
 }
 
 // ---- Switchのキーボードで文字を入力する ----
@@ -382,21 +601,19 @@ static SendView g_view;
 static bool g_cancel = false;
 
 static void drawSending() {
-    SDL_SetRenderDrawColor(g_ren, C_BG.r, C_BG.g, C_BG.b, 255);
-    SDL_RenderClear(g_ren);
+    drawBackground();
     drawHeader("送信中");
-    drawText(80, 120, g_view.title, fTitle, C_TEXT);
-    drawText(80, 190, fitText(fBody, g_view.file, 1120), fBody, C_DIM);
-    drawText(80, 238, fitText(fBody, g_view.status, 1120), fBody, C_TEXT);
-    fillRect(80, 296, 1120, 22, C_BAR);
-    int w = (int)(1120 * std::min(1.0, std::max(0.0, g_view.frac)));
-    fillRect(80, 296, w, 22, C_ACC);
-    int y = 350;
-    size_t start = g_view.results.size() > 7 ? g_view.results.size() - 7 : 0;
+    drawCard(36, 92, 1208, 200);
+    drawText(64, 104, g_view.title, fTitle, C_TEXT);
+    drawText(64, 156, fitText(fBody, g_view.file, 1150), fBody, C_DIM);
+    drawText(64, 192, fitText(fBody, g_view.status, 1150), fBody, C_TEXT);
+    drawProgress(64, 252, 1152, 14, g_view.frac);
+    int y = 312;
+    size_t start = g_view.results.size() > 10 ? g_view.results.size() - 10 : 0;
     for (size_t i = start; i < g_view.results.size(); i++) {
         SDL_Color c = g_view.results[i].second == 0 ? C_OK : (g_view.results[i].second == 1 ? C_WARN : C_NG);
-        drawText(80, y, fitText(fSmall, g_view.results[i].first, 1120), fSmall, c);
-        y += 36;
+        drawText(64, y, fitText(fSmall, g_view.results[i].first, 1150), fSmall, c);
+        y += 30;
     }
     drawFooter("B: 中止(いま送っているファイルを止めます)");
     SDL_RenderPresent(g_ren);
@@ -992,9 +1209,9 @@ static void thumbEvict(const std::vector<Item> &items, int from, int to) {
 // ====================================================================
 #define GRID_COLS 5
 #define GRID_ROWS 3
-#define TILE_W 224
-#define TILE_H 126
-#define GRID_X0 40
+#define TILE_W 216
+#define TILE_H 122
+#define GRID_X0 44
 #define GRID_Y0 100
 #define GRID_PX 244
 #define GRID_PY 172
@@ -1029,7 +1246,9 @@ static std::string shortTime(const std::string &name) {
 static bool overLimit(Item &it) { return itemSize(it) > (long long)g_cfg.limitMB * 1048576LL - 65536; }
 
 static void drawTile(Item &it, int x, int y, bool cursor) {
-    fillRect(x, y, TILE_W, TILE_H, SDL_Color{14, 15, 22, 255});
+    // 札(カード)の上にサムネをのせる
+    fillRRect(x - 8, y - 8, TILE_W + 16, TILE_H + 40, 10, cursor ? C_CARD2 : SDL_Color{30, 32, 46, 225});
+    fillRect(x, y, TILE_W, TILE_H, SDL_Color{12, 13, 20, 255});
     auto f = g_thumbs.find(it.full);
     bool have = f != g_thumbs.end() && f->second.t;
     if (have) {
@@ -1038,40 +1257,37 @@ static void drawTile(Item &it, int x, int y, bool cursor) {
         SDL_Rect dst = {x + (TILE_W - dw) / 2, y + (TILE_H - dh) / 2, dw, dh};
         SDL_RenderCopy(g_ren, f->second.t, nullptr, &dst);
     } else if (f != g_thumbs.end() && f->second.failed) {
-        drawText(x + TILE_W / 2, y + TILE_H / 2 - 16, "表示できません", fSmall, C_DIM, 2);
+        drawTextMid(x + TILE_W / 2, y + TILE_H / 2, "表示できません", fSmall, C_DIM, 2);
     } else {
-        drawText(x + TILE_W / 2, y + TILE_H / 2 - 16, "読み込み中...", fSmall, C_DIM, 2);
+        drawTextMid(x + TILE_W / 2, y + TILE_H / 2, "読み込み中...", fSmall, C_DIM, 2);
     }
     if (it.kind == MK_VIDEO) {
         if (have) {
-            fillCircle(x + TILE_W / 2, y + TILE_H / 2, 24, SDL_Color{0, 0, 0, 150});
-            fillPlayMark(x + TILE_W / 2, y + TILE_H / 2, 26, SDL_Color{255, 255, 255, 255});
+            fillCircle(x + TILE_W / 2, y + TILE_H / 2, 22, SDL_Color{0, 0, 0, 150});
+            fillPlayMark(x + TILE_W / 2, y + TILE_H / 2, 24, SDL_Color{255, 255, 255, 255});
         }
-        fillRect(x + 4, y + TILE_H - 36, 62, 32, SDL_Color{0, 0, 0, 180});
-        drawText(x + 10, y + TILE_H - 36, "動画", fSmall, C_WARN);
+        fillRRect(x + 6, y + TILE_H - 28, 48, 22, 6, SDL_Color{0, 0, 0, 190});
+        drawTextMid(x + 30, y + TILE_H - 17, "動画", fSmall, C_WARN, 2);
     }
     // チェック
-    fillRect(x + 6, y + 6, 28, 28, SDL_Color{0, 0, 0, 160});
-    frameRect(x + 6, y + 6, 28, 28, C_TEXT);
-    if (it.sel) fillRect(x + 11, y + 11, 18, 18, C_OK);
+    fillRRect(x + 6, y + 6, 24, 24, 6, SDL_Color{0, 0, 0, 160});
+    strokeRRect(x + 6, y + 6, 24, 24, 6, 2, C_WHITE);
+    if (it.sel) fillRRect(x + 11, y + 11, 14, 14, 4, C_OK);
     if (it.sent) {
-        fillRect(x + TILE_W - 76, y + 6, 70, 32, SDL_Color{0, 0, 0, 180});
-        drawText(x + TILE_W - 10, y + 6, "送信済", fSmall, C_OK, 1);
+        fillRRect(x + TILE_W - 62, y + 6, 56, 22, 6, SDL_Color{0, 0, 0, 190});
+        drawTextMid(x + TILE_W - 34, y + 17, "送信済", fSmall, C_OK, 2);
     }
-    if (cursor) {
-        for (int i = 0; i < 4; i++) frameRect(x - 1 - i, y - 1 - i, TILE_W + 2 + 2 * i, TILE_H + 2 + 2 * i, C_ACC);
-    }
+    if (cursor) strokeRRect(x - 10, y - 10, TILE_W + 20, TILE_H + 44, 12, 3, C_ACC2);
     // 下の文字: 日時と大きさ。上限を超えるものは色を変える
-    int ly = y + TILE_H + 6;
-    drawText(x, ly, shortTime(it.name), fSmall, C_TEXT);
+    int ly = y + TILE_H + 14;
+    drawTextMid(x, ly, shortTime(it.name), fSmall, C_TEXT);
     SDL_Color sc = C_DIM;
     if (overLimit(it)) sc = (it.kind == MK_VIDEO && g_cfg.trim) ? C_WARN : C_NG;
-    drawText(x + TILE_W, ly, fmtMB(itemSize(it)), fSmall, sc, 1);
+    drawTextMid(x + TILE_W, ly, fmtMB(itemSize(it)), fSmall, sc, 1);
 }
 
 static void clearScreen() {
-    SDL_SetRenderDrawColor(g_ren, C_BG.r, C_BG.g, C_BG.b, 255);
-    SDL_RenderClear(g_ren);
+    drawBackground();
 }
 
 static void previewInfoBar(Item &it) {
@@ -1278,7 +1494,7 @@ struct ListRow { std::string left, right; };
 
 // A: 選んだ番号を返す  B: -1
 static int pickList(const std::string &sub, const std::vector<ListRow> &rows, int &cur, const char *hint) {
-    const int ROWS = 11;
+    const int ROWS = 10, PITCH = 54, RH = 48, Y0 = 92;
     int n = (int)rows.size();
     if (cur >= n) cur = 0;
     int top = cur >= ROWS ? cur - ROWS + 1 : 0;
@@ -1288,10 +1504,23 @@ static int pickList(const std::string &sub, const std::vector<ListRow> &rows, in
         for (int r = 0; r < ROWS; r++) {
             int i = top + r;
             if (i >= n) break;
-            int y = 108 + r * 48;
-            if (i == cur) fillRect(40, y - 4, 1200, 48, C_ACC);
-            drawText(80, y, rows[i].left, fBody, C_TEXT);
-            drawText(1200, y, rows[i].right, fBody, C_TEXT, 1);
+            int y = Y0 + r * PITCH;
+            bool sel = i == cur;
+            if (sel) {
+                fillRRect(36, y, 1196, RH, 10, C_ACC);
+                strokeRRect(36, y, 1196, RH, 10, 2, C_ACC2);
+            } else {
+                fillRRect(36, y, 1196, RH, 10, SDL_Color{34, 37, 54, 200});
+            }
+            drawTextMid(64, y + RH / 2, rows[i].left, fBody, sel ? C_WHITE : C_TEXT);
+            drawTextMid(1206, y + RH / 2, rows[i].right, fBody, sel ? C_WHITE : C_DIM, 1);
+        }
+        if (n > ROWS) {  // 右端の、どのあたりを見ているかの目印
+            int track = ROWS * PITCH - 6;
+            int th = std::max(30, track * ROWS / n);
+            int ty = Y0 + (track - th) * top / (n - ROWS);
+            fillRRect(1244, Y0, 6, track, 3, SDL_Color{255, 255, 255, 25});
+            fillRRect(1244, ty, 6, th, 3, C_ACC2);
         }
         drawFooter(hint);
         endFrame();
@@ -1370,26 +1599,34 @@ static void screenSettings() {
         toast = ok ? "保存しました" : "保存できませんでした";
         toastUntil = SDL_GetTicks() + 1800;
     };
-    const int N = 6;
+    const int N = 7;
     while (!g_quit && appletMainLoop()) {
         beginFrame();
         drawHeader("設定");
-        const char *names[N] = {"Webhook URL", "写真・動画の自動送信", "送れるファイルの上限", "大きい動画を削って送る", "Albumの場所", "戻る"};
+        const char *names[N] = {"Webhook URL", "写真・動画の自動送信", "送れるファイルの上限", "大きい動画を削って送る",
+                                "Albumの場所", "起動時にアップデートを確認", "戻る"};
         std::string vals[N];
         vals[0] = maskHook(g_cfg.hook);
         vals[1] = g_cfg.autoSend ? "オン" : "オフ";
         vals[2] = std::to_string(g_cfg.limitMB) + " MB";
         vals[3] = g_cfg.trim ? "する" : "しない";
         vals[4] = g_cfg.album == DEFAULT_ALBUM ? "標準(SDカードのAlbum)" : g_cfg.album;
-        vals[5] = "";
+        vals[5] = g_cfg.updCheck ? "する" : "しない";
+        vals[6] = "";
         for (int i = 0; i < N; i++) {
-            int y = 112 + i * 68;
-            if (i == cur) fillRect(40, y - 8, 1200, 62, C_ACC);
-            drawText(80, y, names[i], fBody, C_TEXT);
-            SDL_Color vc = C_TEXT;
+            int y = 92 + i * 58;
+            bool sel = i == cur;
+            if (sel) {
+                fillRRect(36, y, 1208, 50, 10, C_ACC);
+                strokeRRect(36, y, 1208, 50, 10, 2, C_ACC2);
+            } else {
+                fillRRect(36, y, 1208, 50, 10, SDL_Color{34, 37, 54, 200});
+            }
+            drawTextMid(64, y + 25, names[i], fBody, sel ? C_WHITE : C_TEXT);
+            SDL_Color vc = sel ? C_WHITE : C_DIM;
             if (i == 0 && !hookOk()) vc = C_WARN;
             if (i == 1) vc = g_cfg.autoSend ? C_OK : C_WARN;
-            if (!vals[i].empty()) drawText(1200, y, fitText(fBody, vals[i], 700), fBody, vc, 1);
+            if (!vals[i].empty()) drawTextMid(1216, y + 25, fitText(fBody, vals[i], 700), fBody, vc, 1);
         }
         std::string hint;
         if (cur == 0) hint = "A: 入力(長いURLは、PCで config.txt を書き換えるほうが楽です)";
@@ -1397,10 +1634,12 @@ static void screenSettings() {
         else if (cur == 2) hint = "左右: 1MBずつ  L/R: 10MBずつ  A: 数字で入力  (ブーストなしのサーバーは約10MB)";
         else if (cur == 3) hint = "A: する/しない を切り替え(しない: 大きい動画は送りません)";
         else if (cur == 4) hint = "A: 入力(空にすると標準に戻る)。emuMMCのときだけ変えます";
+        else if (cur == 5) hint = "A: する/しない を切り替え(する: アプリを開いたとき、新しい版がないかGitHubで確かめます)";
         else hint = "A または B: 戻る";
-        drawText(48, 540, fitText(fSmall, hint, 1180), fSmall, C_DIM);
-        if (SDL_GetTicks() < toastUntil) drawText(1232, 110, toast, fSmall, C_OK, 1);
-        drawFooter("上下: 選ぶ   A: 変える   B: 戻る(変えた内容は、すぐ保存されます。常駐版は5秒ごとに読み直します)");
+        drawText(48, 508, fitText(fSmall, hint, 1180), fSmall, C_TEXT);
+        drawText(48, 540, "変えた内容は、すぐ保存されます。常駐版は5秒ごとに読み直します", fSmall, C_DIM);
+        if (SDL_GetTicks() < toastUntil) drawText(1244, 540, toast, fSmall, C_OK, 1);
+        drawFooter("上下: 選ぶ  A: 変える  B: 戻る");
         endFrame();
 
         if (pressed(BT_B)) return;
@@ -1439,10 +1678,14 @@ static void screenSettings() {
                     g_cfg.album = out.empty() ? std::string(DEFAULT_ALBUM) : out;
                     changed();
                 }
+            } else if (cur == 5) {
+                g_cfg.updCheck = !g_cfg.updCheck;
+                changed();
             } else {
                 return;
             }
         }
+        if (cur == 5 && (pressed(BT_RIGHT) || pressed(BT_LEFT))) { g_cfg.updCheck = !g_cfg.updCheck; changed(); }
         SDL_Delay(16);
     }
 }
@@ -1470,26 +1713,38 @@ static void screenStatus() {
     Result rc = pmdmntGetProcessId(&pid, SYS_TITLE_ID);
     std::string running = R_SUCCEEDED(rc) && pid != 0 ? "動いています" : (R_SUCCEEDED(rc) ? "止まっています" : "確認できませんでした");
 
-    int top = lines.size() > 12 ? (int)lines.size() - 12 : 0;
+    const int LOGROWS = 17;
+    int top = (int)lines.size() > LOGROWS ? (int)lines.size() - LOGROWS : 0;
     while (!g_quit && appletMainLoop()) {
         beginFrame();
         drawHeader("常駐版の状態");
-        drawText(80, 110, "常駐版: " + running, fBody, running == "動いています" ? C_OK : C_WARN);
-        drawText(520, 110, "版: " + ver, fBody, C_TEXT);
-        drawText(760, 110, std::string("Wi-Fi: ") + (networkUp() ? "つながっています" : "つながっていません"), fBody, networkUp() ? C_OK : C_WARN);
-        drawText(80, 154, std::string("Webhook: ") + (hookOk() ? "設定済み" : "未設定"), fBody, hookOk() ? C_OK : C_WARN);
-        if (!hasLog) drawText(80, 230, "常駐版のログ(log.txt)がありません。常駐版が、まだ動いていないかもしれません。", fSmall, C_WARN);
-        for (int r = 0; r < 12; r++) {
+        bool up = networkUp();
+        struct Chip { const char *label; std::string value; SDL_Color c; };
+        Chip chips[4] = {
+            {"常駐版", running, running == "動いています" ? C_OK : C_WARN},
+            {"常駐版の版", ver, C_TEXT},
+            {"Wi-Fi", up ? "つながっています" : "つながっていません", up ? C_OK : C_WARN},
+            {"Webhook", hookOk() ? "設定済み" : "未設定", hookOk() ? C_OK : C_WARN},
+        };
+        for (int i = 0; i < 4; i++) {
+            int x = 36 + i * 306;
+            drawCard(x, 90, 296, 68);
+            drawText(x + 18, 96, chips[i].label, fSmall, C_DIM);
+            drawText(x + 18, 120, fitText(fBody, chips[i].value, 262), fBody, chips[i].c);
+        }
+        drawCard(36, 170, 1208, 482);
+        if (!hasLog) drawText(60, 190, "常駐版のログ(log.txt)がありません。常駐版が、まだ動いていないかもしれません。", fSmall, C_WARN);
+        for (int r = 0; r < LOGROWS; r++) {
             int i = top + r;
             if (i >= (int)lines.size()) break;
-            drawText(80, 210 + r * 34, fitText(fSmall, lines[i], 1120), fSmall, C_TEXT);
+            drawText(60, 184 + r * 26, fitText(fSmall, lines[i], 1160), fSmall, C_TEXT);
         }
-        drawFooter("上下: ログをめくる   B: 戻る");
+        drawFooter("上下: ログをめくる  B: 戻る");
         endFrame();
 
         if (pressed(BT_B)) return;
         if (pressed(BT_UP) && top > 0) top--;
-        if (pressed(BT_DOWN) && top + 12 < (int)lines.size()) top++;
+        if (pressed(BT_DOWN) && top + LOGROWS < (int)lines.size()) top++;
         SDL_Delay(16);
     }
 }
@@ -1518,32 +1773,445 @@ static void doTestSend() {
 }
 
 // ====================================================================
+// アップデート(GitHubのReleasesから、アプリ本体と常駐版を更新する)
+// ====================================================================
+struct UpdInfo {
+    bool checked = false;  // 確認した
+    bool ok = false;       // 確認に成功した
+    bool newer = false;    // 新しい版がある
+    bool hasNro = false;   // Releaseにアプリ本体が付いている
+    bool hasNsp = false;   // Releaseに常駐版が付いている
+    std::string tag;       // 例: v1.2.2
+    std::string err;
+};
+static UpdInfo g_upd;
+static std::string g_selfPath = SELF_DEFAULT_PATH;  // 動いているNXShot.nroの場所
+
+static bool fileExists(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0;
+}
+
+// ホームブリューメニューが教えてくれる起動パス(argv[0])から、自分のnroの場所を決める
+static void initSelfPath(int argc, char **argv) {
+    if (argc < 1 || !argv || !argv[0]) return;
+    std::string a = argv[0];
+    if (a.size() >= 2 && a.front() == '"' && a.back() == '"') a = a.substr(1, a.size() - 2);
+    if (!a.empty() && a[0] == '/') a = "sdmc:" + a;
+    if (a.compare(0, 6, "sdmc:/") != 0 || a.size() < 10) return;
+    std::string ext = a.substr(a.size() - 4);
+    for (auto &ch : ext) ch = (char)tolower((unsigned char)ch);
+    if (ext != ".nro" || !fileExists(a)) return;
+    g_selfPath = a;
+}
+
+static size_t strWriteCb(char *p, size_t sz, size_t n, void *u) {
+    std::string *o = (std::string *)u;
+    if (o->size() + sz * n > (size_t)(1 << 20)) return 0;
+    o->append(p, sz * n);
+    return sz * n;
+}
+
+// 文字として取る。戻り値: HTTPの番号 / 通信できなければ -1 (理由は err)
+static long httpGetString(const std::string &url, std::string &out, long timeoutSec, std::string &err) {
+    CURL *c = curl_easy_init();
+    if (!c) { err = "通信の準備に失敗しました"; return -1; }
+    setCommon(c, url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, strWriteCb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &out);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 6L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, timeoutSec);
+    struct curl_slist *h = curl_slist_append(nullptr, "Accept: application/vnd.github+json");
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(h);
+    curl_easy_cleanup(c);
+    if (rc != CURLE_OK) {
+        err = std::string("通信に失敗しました(") + curl_easy_strerror(rc) + ")";
+        applog("update: curl error %d (%s) %s", (int)rc, curl_easy_strerror(rc), g_errbuf);
+        return -1;
+    }
+    return code;
+}
+
+// JSONから "key": "文字" の文字を取り出す(最初に出てくるもの)
+static std::string jsonStrField(const std::string &j, const char *key) {
+    std::string k = std::string("\"") + key + "\"";
+    size_t p = j.find(k);
+    if (p == std::string::npos) return "";
+    p = j.find(':', p + k.size());
+    if (p == std::string::npos) return "";
+    p = j.find('"', p);
+    if (p == std::string::npos) return "";
+    size_t e = j.find('"', p + 1);
+    if (e == std::string::npos) return "";
+    return j.substr(p + 1, e - p - 1);
+}
+
+static bool parseVer(const std::string &s, int v[3]) {
+    const char *p = s.c_str();
+    if (*p == 'v' || *p == 'V') p++;
+    v[0] = v[1] = v[2] = 0;
+    int n = 0;
+    while (*p >= '0' && *p <= '9' && n < 3) {
+        v[n++] = atoi(p);
+        while (*p >= '0' && *p <= '9') p++;
+        if (*p == '.') p++;
+        else break;
+    }
+    return n > 0;
+}
+
+// a が b より新しい版か
+static bool verNewer(const std::string &a, const std::string &b) {
+    int x[3], y[3];
+    if (!parseVer(a, x) || !parseVer(b, y)) return false;
+    for (int i = 0; i < 3; i++) {
+        if (x[i] != y[i]) return x[i] > y[i];
+    }
+    return false;
+}
+
+// GitHubで最新のReleaseを調べる。結果は g_upd に入る
+static bool updCheck(long timeoutSec) {
+    g_upd = UpdInfo();
+    g_upd.checked = true;
+    if (!g_curlReady) { g_upd.err = "通信の準備ができていません"; return false; }
+    std::string body, err;
+    long code = httpGetString(std::string("https://api.github.com/repos/") + UPDATE_REPO + "/releases/latest", body,
+                              timeoutSec, err);
+    if (code < 0) { g_upd.err = err; return false; }
+    if (code == 404) { g_upd.err = "公開されたリリースが見つかりませんでした"; return false; }
+    if (code == 403) { g_upd.err = "GitHubの回数制限に当たりました。しばらくしてからもう一度試してください"; return false; }
+    if (code != 200) { g_upd.err = "GitHubが http " + std::to_string(code) + " を返しました"; return false; }
+    g_upd.tag = jsonStrField(body, "tag_name");
+    if (g_upd.tag.empty()) { g_upd.err = "版の情報を読めませんでした"; return false; }
+    g_upd.hasNro = body.find(std::string("/") + UPDATE_NRO_NAME + "\"") != std::string::npos;
+    g_upd.hasNsp = body.find(std::string("/") + UPDATE_NSP_NAME + "\"") != std::string::npos;
+    g_upd.newer = verNewer(g_upd.tag, APP_VERSION_STR);
+    g_upd.ok = true;
+    applog("update: latest=%s newer=%d nro=%d nsp=%d", g_upd.tag.c_str(), g_upd.newer ? 1 : 0, g_upd.hasNro ? 1 : 0,
+           g_upd.hasNsp ? 1 : 0);
+    return true;
+}
+
+// ---- ダウンロード ----
+struct DlView {
+    std::string title;
+    double frac = 0;
+    long long got = 0, total = 0;
+};
+static DlView g_dl;
+static bool g_dlCancel = false;
+
+static void drawDownloading() {
+    drawBackground();
+    drawHeader("アップデート");
+    drawCard(36, 100, 1208, 170);
+    drawText(64, 116, fitText(fBody, g_dl.title, 1150), fBody, C_TEXT);
+    std::string sz = g_dl.total > 0 ? fmtMB(g_dl.got) + " / " + fmtMB(g_dl.total) : fmtMB(g_dl.got);
+    drawText(64, 156, sz, fSmall, C_DIM);
+    char pc[16];
+    snprintf(pc, sizeof(pc), "%d%%", (int)(std::min(1.0, g_dl.frac) * 100));
+    drawText(1216, 156, pc, fSmall, C_TEXT, 1);
+    drawProgress(64, 204, 1152, 14, g_dl.frac);
+    drawFooter("B: 中止");
+    SDL_RenderPresent(g_ren);
+}
+
+static size_t fileWriteCb(char *p, size_t sz, size_t n, void *u) { return fwrite(p, sz, n, (FILE *)u); }
+
+static int dlProgressCb(void *, curl_off_t dltotal, curl_off_t dlnow, curl_off_t, curl_off_t) {
+    static Uint32 last = 0;
+    Uint32 now = SDL_GetTicks();
+    if (now - last < 100) return 0;
+    last = now;
+    g_dl.got = dlnow;
+    g_dl.total = dltotal;
+    g_dl.frac = dltotal > 0 ? (double)dlnow / (double)dltotal : 0;
+    updateInput();
+    if (g_quit || g_cur[BT_B]) { g_dlCancel = true; return 1; }
+    drawDownloading();
+    return 0;
+}
+
+static bool downloadFile(const std::string &url, const std::string &path, std::string &err) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f) { err = "保存先を開けません(" + path + ")"; return false; }
+    CURL *c = curl_easy_init();
+    if (!c) { fclose(f); remove(path.c_str()); err = "通信の準備に失敗しました"; return false; }
+    setCommon(c, url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, fileWriteCb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, f);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(c, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(c, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 600L);
+    curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, dlProgressCb);
+    g_dlCancel = false;
+    g_dl.frac = 0;
+    g_dl.got = g_dl.total = 0;
+    CURLcode rc = curl_easy_perform(c);
+    long code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(c);
+    fclose(f);
+    if (rc != CURLE_OK) {
+        remove(path.c_str());
+        if (g_dlCancel) err = "中止しました";
+        else if (rc == CURLE_HTTP_RETURNED_ERROR) err = "ダウンロードできませんでした(http " + std::to_string(code) + ")";
+        else err = std::string("ダウンロードに失敗しました(") + curl_easy_strerror(rc) + ")";
+        applog("update: download %s rc=%d code=%ld", url.c_str(), (int)rc, code);
+        return false;
+    }
+    return true;
+}
+
+// ファイルの大きさと、決まった位置の目印(NROなら0x10に "NRO0"、NSPなら先頭に "PFS0")を確かめる
+static bool fileHasMagic(const std::string &path, long off, const char *magic, size_t mlen, long minSize) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    bool ok = sz >= minSize;
+    if (ok) {
+        char b[8] = {0};
+        fseek(f, off, SEEK_SET);
+        ok = fread(b, 1, mlen, f) == mlen && memcmp(b, magic, mlen) == 0;
+    }
+    fclose(f);
+    return ok;
+}
+
+// 新しいファイルを本番の名前にする。古いほうは、いったん .bak に退避して、成功したら消す
+static bool swapFile(const std::string &tmp, const std::string &dst, std::string &err) {
+    std::string bak = dst + ".bak";
+    bool had = fileExists(dst);
+    remove(bak.c_str());
+    if (had && rename(dst.c_str(), bak.c_str()) != 0) {
+        err = "いまのファイルを置き換えられません(" + std::string(strerror(errno)) + ")";
+        return false;
+    }
+    if (rename(tmp.c_str(), dst.c_str()) != 0) {
+        err = "新しいファイルを置けません(" + std::string(strerror(errno)) + ")";
+        if (had) rename(bak.c_str(), dst.c_str());  // 元に戻す
+        return false;
+    }
+    if (had) remove(bak.c_str());
+    return true;
+}
+
+static void updFail(const std::string &err, const std::vector<std::string> &extra = {}) {
+    std::vector<std::string> lines = {err};
+    for (auto &e : extra) lines.push_back(e);
+    showMessage("更新できませんでした", lines, false);
+}
+
+static void screenUpdate() {
+    if (!g_curlReady || !networkUp()) {
+        showMessage("Wi-Fiにつながっていません", {"つながってから、もう一度試してください"}, false);
+        return;
+    }
+    drawStatusScreen("アップデート", "GitHubで最新の版を確認しています...");
+    if (!updCheck(10)) {
+        showMessage("確認できませんでした", {g_upd.err}, false);
+        return;
+    }
+    if (!g_upd.newer) {
+        showMessage("最新の版です", {"いまの版: v" APP_VERSION_STR, "GitHubの最新: " + g_upd.tag}, true);
+        return;
+    }
+    if (!g_upd.hasNro) {
+        showMessage("更新ファイルが見つかりません", {"リリース " + g_upd.tag + " に " + UPDATE_NRO_NAME + " が付いていません"}, false);
+        return;
+    }
+    bool sysPresent = fileExists(SYS_NSP_PATH);
+    bool doSys = sysPresent && g_upd.hasNsp;
+
+    // 確認
+    for (;;) {
+        if (g_quit || !appletMainLoop()) return;
+        beginFrame();
+        drawHeader("アップデート");
+        drawCard(36, 100, 1208, 300);
+        fillRRect(64, 128, 8, 36, 4, C_OK);
+        drawText(88, 124, "新しい版があります", fTitle, C_OK);
+        drawText(88, 190, "いまの版: v" APP_VERSION_STR, fBody, C_DIM);
+        drawText(88, 228, "新しい版: " + g_upd.tag, fBody, C_TEXT);
+        drawText(88, 280, "更新するもの", fSmall, C_DIM);
+        drawText(88, 308, std::string("・アプリ(") + UPDATE_NRO_NAME + ")", fBody, C_TEXT);
+        if (doSys) drawText(88, 346, "・常駐版(Switchを再起動すると、新しくなります)", fBody, C_TEXT);
+        else if (!sysPresent) drawText(88, 346, "・常駐版は入っていないので、更新しません", fBody, C_DIM);
+        else drawText(88, 346, "・常駐版は、このリリースに付いていないので、更新しません", fBody, C_DIM);
+        drawFooter("A: 更新する  B: やめる");
+        endFrame();
+        if (pressed(BT_B)) return;
+        if (pressed(BT_A)) break;
+        SDL_Delay(16);
+    }
+
+    std::string base = std::string("https://github.com/") + UPDATE_REPO + "/releases/download/" + g_upd.tag + "/";
+    std::string nroNew = g_selfPath + ".new";
+    std::string nspNew = std::string(SYS_NSP_PATH) + ".new";
+    std::string err;
+
+    g_dl = DlView();
+    g_dl.title = std::string("アプリ(") + UPDATE_NRO_NAME + ")をダウンロードしています";
+    drawDownloading();
+    bool ok = downloadFile(base + UPDATE_NRO_NAME, nroNew, err);
+    if (ok && !fileHasMagic(nroNew, 0x10, "NRO0", 4, 100000)) { ok = false; err = "ダウンロードしたファイルが、アプリではありませんでした"; }
+    if (!ok) {
+        remove(nroNew.c_str());
+        updFail(err, {"いまのアプリは、そのまま使えます"});
+        return;
+    }
+    if (doSys) {
+        g_dl = DlView();
+        g_dl.title = std::string("常駐版(") + UPDATE_NSP_NAME + ")をダウンロードしています";
+        drawDownloading();
+        ok = downloadFile(base + UPDATE_NSP_NAME, nspNew, err);
+        if (ok && !fileHasMagic(nspNew, 0, "PFS0", 4, 4096)) { ok = false; err = "ダウンロードしたファイルが、常駐版ではありませんでした"; }
+        if (!ok) {
+            remove(nroNew.c_str());
+            remove(nspNew.c_str());
+            updFail(err, {"いまのアプリと常駐版は、そのまま使えます"});
+            return;
+        }
+    }
+
+    // 入れ替え(常駐版 → アプリ の順)
+    drawStatusScreen("アップデート", "入れ替えています...");
+    if (doSys && !swapFile(nspNew, SYS_NSP_PATH, err)) {
+        remove(nroNew.c_str());
+        remove(nspNew.c_str());
+        updFail(err, {"いまのアプリと常駐版は、そのまま使えます"});
+        return;
+    }
+    if (!swapFile(nroNew, g_selfPath, err)) {
+        std::vector<std::string> ex = {"新しいアプリは " + nroNew + " に置いてあります"};
+        ex.push_back("PCやファイル管理で、NXShot.nro と入れ替えてください");
+        if (doSys) ex.push_back("常駐版は、すでに新しくなっています(再起動で反映)");
+        updFail(err, ex);
+        return;
+    }
+    applog("update: done -> %s (sys=%d)", g_upd.tag.c_str(), doSys ? 1 : 0);
+
+    std::vector<std::string> lines = {std::string("アプリを ") + g_upd.tag + " にしました"};
+    if (doSys) lines.push_back("常駐版も新しくしました(Switchを再起動すると、新しい版で動きます)");
+    bool relaunch = envHasNextLoad();
+    lines.push_back(relaunch ? "Aを押すと、新しいアプリを開き直します" : "いったん終了します。ホームブリューメニューから、開き直してください");
+    showMessage("更新しました", lines, true);
+    if (relaunch) envSetNextLoad(g_selfPath.c_str(), g_selfPath.c_str());
+    g_quit = true;
+}
+
+// ---- メニューの小さな絵(基本図形で描く) ----
+// kind: 0=写真 1=設定 2=送信 3=状態 4=アップデート 5=終了   bg: 絵の下の色(穴あけ用)
+static void drawIcon(int kind, int cx, int cy, SDL_Color c, SDL_Color bg) {
+    switch (kind) {
+        case 0:  // 写真: 枠 + 太陽 + 山
+            strokeRRect(cx - 13, cy - 10, 26, 20, 5, 2, c);
+            fillCircle(cx + 5, cy - 3, 3, c);
+            fillTri(cx - 9, cy + 7, cx - 3, cy - 1, cx + 3, cy + 7, c);
+            fillTri(cx - 1, cy + 7, cx + 4, cy + 1, cx + 9, cy + 7, c);
+            break;
+        case 1:  // 設定: 歯車
+            fillRect(cx - 2, cy - 13, 4, 6, c);
+            fillRect(cx - 2, cy + 7, 4, 6, c);
+            fillRect(cx - 13, cy - 2, 6, 4, c);
+            fillRect(cx + 7, cy - 2, 6, 4, c);
+            fillCircle(cx, cy, 9, c);
+            fillCircle(cx, cy, 4, bg);
+            break;
+        case 2:  // 送信: 紙ひこうき
+            fillTri(cx - 12, cy - 1, cx + 12, cy - 11, cx + 3, cy + 11, c);
+            fillTri(cx - 2, cy + 1, cx + 12, cy - 11, cx + 3, cy + 11, bg);
+            thickLine(cx - 2, cy + 1, cx + 11, cy - 10, 3, c);
+            break;
+        case 3:  // 状態: 脈
+            thickLine(cx - 13, cy, cx - 6, cy, 3, c);
+            thickLine(cx - 6, cy, cx - 3, cy - 9, 3, c);
+            thickLine(cx - 3, cy - 9, cx + 2, cy + 9, 3, c);
+            thickLine(cx + 2, cy + 9, cx + 5, cy, 3, c);
+            thickLine(cx + 5, cy, cx + 13, cy, 3, c);
+            break;
+        case 4:  // アップデート: 下向きの矢印と台
+            fillRect(cx - 3, cy - 12, 6, 11, c);
+            fillTri(cx - 10, cy - 2, cx + 10, cy - 2, cx, cy + 9, c);
+            fillRect(cx - 12, cy + 12, 24, 3, c);
+            break;
+        default:  // 終了: 電源
+            fillCircle(cx, cy + 1, 11, c);
+            fillCircle(cx, cy + 1, 7, bg);
+            fillRect(cx - 4, cy - 14, 8, 12, bg);
+            fillRect(cx - 2, cy - 13, 4, 12, c);
+            break;
+    }
+}
+
+// ====================================================================
 // メニュー
 // ====================================================================
 static void screenMenu() {
-    const char *items[] = {"写真・動画を選んで送る", "設定", "テスト送信", "常駐版の状態とログ", "終了"};
-    const int N = 5;
+    const char *items[] = {"写真・動画を選んで送る", "設定", "テスト送信", "常駐版の状態とログ", "アップデート", "終了"};
+    const int N = 6;
     int cur = 0;
     while (!g_quit && appletMainLoop()) {
         beginFrame();
-        drawHeader(std::string("アプリ v") + APP_VERSION_STR);
+        drawHeader(std::string("v") + APP_VERSION_STR);
         for (int i = 0; i < N; i++) {
-            int y = 126 + i * 72;
-            if (i == cur) fillRect(40, y - 8, 760, 64, C_ACC);
-            drawText(80, y + 2, items[i], fBody, C_TEXT);
+            int y = 92 + i * 72;
+            bool sel = i == cur;
+            if (sel) {
+                fillRRect(36, y, 770, 62, 12, C_ACC);
+                strokeRRect(36, y, 770, 62, 12, 2, C_ACC2);
+            } else {
+                fillRRect(36, y, 770, 62, 12, SDL_Color{34, 37, 54, 200});
+            }
+            SDL_Color tileBg = sel ? SDL_Color{255, 255, 255, 255} : SDL_Color{52, 57, 86, 255};
+            fillRRect(50, y + 9, 44, 44, 11, tileBg);
+            drawIcon(i, 72, y + 31, sel ? C_ACC : C_ACC2, tileBg);
+            drawTextMid(112, y + 31, items[i], fBody, sel ? C_WHITE : C_TEXT);
+            if (i == 4 && g_upd.ok && g_upd.newer) {
+                fillRRect(660, y + 17, 130, 28, 14, C_WARN);
+                drawTextMid(725, y + 31, g_upd.tag + " あり", fSmall, SDL_Color{40, 36, 10, 255}, 2);
+            }
         }
         // 右側の状態パネル
-        fillRect(840, 118, 400, 330, C_BAR);
-        drawText(864, 134, "いまの状態", fBody, C_TEXT);
-        drawText(864, 188, std::string("Webhook: ") + (hookOk() ? "設定済み" : "未設定"), fSmall, hookOk() ? C_OK : C_WARN);
-        drawText(864, 228, std::string("Wi-Fi: ") + (networkUp() ? "つながっています" : "つながっていません"), fSmall, networkUp() ? C_OK : C_WARN);
-        drawText(864, 268, std::string("自動送信: ") + (g_cfg.autoSend ? "オン" : "オフ"), fSmall, g_cfg.autoSend ? C_OK : C_WARN);
-        drawText(864, 308, "上限: " + std::to_string(g_cfg.limitMB) + " MB", fSmall, C_TEXT);
-        drawText(864, 348, std::string("大きい動画を削る: ") + (g_cfg.trim ? "する" : "しない"), fSmall, C_TEXT);
-        drawText(864, 388, "送信済み(記録): " + std::to_string(g_sent.size()) + "件", fSmall, C_TEXT);
-        if (!hookOk()) drawText(80, 520, "はじめに「設定」で、Webhook URLを入れてください", fBody, C_WARN);
-        drawFooter(g_cfg.autoSend ? "上下: 選ぶ   A: 決定   +: 終了   (起動後に撮ったものは、常駐版が自動で送ります)"
-                           : "上下: 選ぶ   A: 決定   +: 終了   (自動送信はオフです。設定でオンにできます)");
+        drawCard(836, 92, 408, 392);
+        drawText(860, 106, "いまの状態", fBody, C_TEXT);
+        bool up = networkUp();
+        struct Row { const char *label; std::string value; SDL_Color c; };
+        Row rows[7] = {
+            {"Webhook", hookOk() ? "設定済み" : "未設定", hookOk() ? C_OK : C_WARN},
+            {"Wi-Fi", up ? "つながっています" : "つながっていません", up ? C_OK : C_WARN},
+            {"自動送信", g_cfg.autoSend ? "オン" : "オフ", g_cfg.autoSend ? C_OK : C_WARN},
+            {"上限", std::to_string(g_cfg.limitMB) + " MB", C_TEXT},
+            {"大きい動画を削る", g_cfg.trim ? "する" : "しない", C_TEXT},
+            {"送信済み(記録)", std::to_string(g_sent.size()) + "件", C_TEXT},
+            {"アプリの版", std::string("v") + APP_VERSION_STR, C_TEXT},
+        };
+        for (int i = 0; i < 7; i++) {
+            int cy = 168 + i * 44;
+            fillRect(860, cy + 22, 360, 1, SDL_Color{255, 255, 255, 18});
+            drawTextMid(860, cy, rows[i].label, fSmall, C_DIM);
+            drawTextMid(1220, cy, rows[i].value, fSmall, rows[i].c, 1);
+        }
+        if (!hookOk()) drawText(40, 540, "はじめに「設定」で、Webhook URLを入れてください", fSmall, C_WARN);
+        if (g_upd.ok && g_upd.newer) {
+            drawCard(36, 570, 770, 72);
+            fillRRect(56, 586, 6, 40, 3, C_WARN);
+            drawText(78, 578, "新しい版 " + g_upd.tag + " があります", fBody, C_WARN);
+            drawText(78, 610, "「アップデート」を選ぶと、アプリと常駐版を新しくできます", fSmall, C_TEXT);
+        }
+        drawFooter(g_cfg.autoSend ? "上下: 選ぶ  A: 決定  +: 終了  (起動後に撮ったものは、常駐版が自動で送ります)"
+                                  : "上下: 選ぶ  A: 決定  +: 終了  (自動送信はオフです。設定でオンにできます)");
         endFrame();
 
         if (pressed(BT_DOWN)) cur = (cur + 1) % N;
@@ -1557,6 +2225,7 @@ static void screenMenu() {
                 case 1: screenSettings(); break;
                 case 2: doTestSend(); break;
                 case 3: screenStatus(); break;
+                case 4: screenUpdate(); break;
                 default: return;
             }
         }
@@ -1569,11 +2238,10 @@ static void screenMenu() {
 // 起動と後始末
 // ====================================================================
 int main(int argc, char **argv) {
-    (void)argc;
-    (void)argv;
     mkdir("sdmc:/config", 0777);
     mkdir(CONFIG_DIR, 0777);
-    applog("app: start v%s", APP_VERSION_STR);
+    initSelfPath(argc, argv);
+    applog("app: start v%s (%s)", APP_VERSION_STR, g_selfPath.c_str());
 
     Result rc = socketInitializeDefault();
     applog("init: socket rc=0x%x", (unsigned)rc);
@@ -1619,20 +2287,26 @@ int main(int argc, char **argv) {
         if (g_win) g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
         if (g_ren) SDL_RenderSetLogicalSize(g_ren, 1280, 720);
         if (g_ren) SDL_SetRenderDrawBlendMode(g_ren, SDL_BLENDMODE_BLEND);
-        fTitle = TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, 40);
-        fBody = TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, 28);
-        fSmall = TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, 22);
+        fTitle = TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, 30);
+        fBody = TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, 21);
+        fSmall = TTF_OpenFontRW(SDL_RWFromMem(fd.address, fd.size), 1, 17);
         applog("init: window=%d renderer=%d fonts=%d%d%d", g_win ? 1 : 0, g_ren ? 1 : 0, fTitle ? 1 : 0, fBody ? 1 : 0,
                fSmall ? 1 : 0);
     }
 
     if (g_win && g_ren && fTitle && fBody && fSmall) {
         initInput();
+        makeBackground();
+        if (g_cfg.updCheck && g_curlReady && networkUp()) {
+            drawStatusScreen("起動中", "アップデートを確認しています...");
+            updCheck(5);
+        }
         screenMenu();
     } else {
         applog("画面を作れませんでした");
     }
 
+    if (g_bg) SDL_DestroyTexture(g_bg);
     for (auto &p : g_texCache) SDL_DestroyTexture(p.second.t);
     g_texCache.clear();
     for (auto &p : g_thumbs) if (p.second.t) SDL_DestroyTexture(p.second.t);
