@@ -45,6 +45,7 @@ extern "C" {
 #define EDIT_DIR "sdmc:/config/nxdiscord/edit"            // 編集した写真・切り出した動画の置き場(送ったら消える)
 #define EDIT_FONT_DIR "sdmc:/config/nxdiscord/fonts"      // 自分で入れたフォント(.ttf .otf .ttc)
 #define EDIT_VIDEO_PATH EDIT_DIR "/cut_tmp.mp4"
+#define EDIT_TEXT_PATH "sdmc:/config/nxdiscord/text.txt"  // PCで書いた文字(日本語など)を、文字入れに使う(1行目だけ)
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define DEFAULT_LIMIT_MB 10
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
@@ -574,6 +575,28 @@ static bool kbdInput(const char *header, const char *guide, const std::string &i
     if (R_FAILED(rc)) { applog("swkbdShow rc=0x%x", (unsigned)rc); return false; }
     out = buf;
     return true;
+}
+
+// 文字入れ用の入力。config/nxdiscord/text.txt があって、いまの文字と違えば、その1行目を使う
+// (Switchのキーボードに日本語が無いとき用。UTF-8で保存する)。それ以外はSwitchのキーボードを開く
+static bool textInput(const char *header, const char *guide, const std::string &init, int maxLen, std::string &out) {
+    FILE *f = fopen(EDIT_TEXT_PATH, "rb");
+    if (f) {
+        char b[512];
+        size_t n = fread(b, 1, sizeof(b) - 1, f);
+        fclose(f);
+        b[n] = 0;
+        std::string t(b);
+        if (t.size() >= 3 && (unsigned char)t[0] == 0xEF && (unsigned char)t[1] == 0xBB && (unsigned char)t[2] == 0xBF) t.erase(0, 3);
+        size_t e = t.find_first_of("\r\n");
+        if (e != std::string::npos) t.erase(e);
+        if (!t.empty() && t != init) {
+            applog("text: text.txt から読み込み (%zu bytes)", t.size());
+            out = t;
+            return true;
+        }
+    }
+    return kbdInput(header, guide, init, maxLen, false, out);
 }
 
 // ====================================================================
@@ -1638,7 +1661,7 @@ static bool screenPhotoEdit(Item &it) {
                     case TL_MOTION: startRegion(cur); break;
                     case TL_TEXT: {
                         std::string out;
-                        if (kbdInput("文字を入れる", "写真に入れる文字", text, 60, false, out) && !out.empty()) {
+                        if (textInput("文字を入れる", "写真に入れる文字(日本語は text.txt でも入れられます)", text, 60, out) && !out.empty()) {
                             text = out;
                             mode = ED_TEXT;
                             tx = base.w / 8;
@@ -1746,7 +1769,7 @@ static bool screenPhotoEdit(Item &it) {
             if (pressed(BT_PLUS)) { style = (style + 1) % 4; maskDirty = true; }
             if (pressed(BT_MINUS)) {
                 std::string out;
-                if (kbdInput("文字を直す", "写真に入れる文字", text, 60, false, out) && !out.empty()) { text = out; maskDirty = true; }
+                if (textInput("文字を直す", "写真に入れる文字", text, 60, out) && !out.empty()) { text = out; maskDirty = true; }
             }
             if (pressed(BT_B)) { mode = ED_MENU; view = base; upload(); }
             else if (pressed(BT_A)) {
