@@ -8,8 +8,8 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 *English: A tiny Atmosphère sysmodule that posts game start/stop notifications and new screenshots/videos straight to a Discord webhook. No PC needed. See the Japanese text below for install steps; the layout is the same as the SD card tree shown there.*
 
 この配布には、2つが入っています。
-- **常駐版**(`exefs.nsp`、版 1.2.1): Switchの裏で動いて、自動で送ります。
-- **アプリ版**(`NXShot.nro`、版 1.2.1): ホームブリューメニューから起動して、昔の写真・動画を送ったり、設定(自動送信のオン/オフなど)を変えたりします。
+- **常駐版**(`exefs.nsp`、版 1.3.0): Switchの裏で動いて、自動で送ります。
+- **アプリ版**(`NXShot.nro`、版 1.3.0): ホームブリューメニューから起動して、昔の写真・動画を送ったり、設定(自動送信のオン/オフなど)を変えたりします。
 
 ## できること
 - ゲームの開始 / 終了(プレイ時間つき)の通知
@@ -25,7 +25,7 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 - Wi-Fi(スクショの保存先はSDカード)
 
 ## インストール
-1. [Releases](../../releases) から `NXShot-1.2.1.zip` をダウンロードして展開します。
+1. [Releases](../../releases) から `NXShot-1.3.0.zip` をダウンロードして展開します。
 2. 中の `atmosphere`、`config`、`switch` の3つのフォルダを、SDカードの直下にコピーします。
 3. SDカードの `config/nxdiscord/config.txt` を開き、1行目の `[ここにWebhook URLを貼る]` を、自分のWebhook URLに書き換えて保存します(カッコも消して、URLだけにします)。2行目の `limit=10` はそのままで大丈夫です(下の「動画について」)。
 4. Switchを再起動します。起動してしばらくすると、Discordに「🟢 NXShot 起動」が届きます。
@@ -59,6 +59,9 @@ SDカードの中身はこうなります。
   - 自動送信をオフにすると、常駐版は写真・動画を送りません。オフの間に撮ったものは、あとでオンにしても、さかのぼっては送りません(必要なら、このアプリから選んで送れます)。
 - **テスト送信**: Webhookが正しいかを確かめます。
 - **アップデート**: GitHubのReleasesで新しい版を確かめ、あれば**アプリ(`NXShot.nro`)と常駐版(`exefs.nsp`)を、Switchの中だけで更新**します(要Wi-Fi)。アプリは更新後に自動で開き直します。常駐版は、Switchを再起動すると新しい版で動きます。設定で、起動時の自動チェックをオフにもできます。
+- **写真の編集**(写真を大きく見る画面で **X**): 切り抜き、文字入れ(大きさ・色・フォント・ふちどり・太字/斜体)、ぼかし、モザイク、モーションブラー。編集したものは、そのままDiscordへ送れます(元の写真は変わりません)。「保存して続ける」で、`config/nxdiscord/edit/` にも残せます。
+  - フォントは標準のほかに、`config/nxdiscord/fonts/` に `.ttf` `.otf` `.ttc` を入れると選べます(日本語を出したいときは、日本語の入ったフォントを)。
+- **動画の切り取り**(動画を見る画面で **X**): 最初と最後を選んで、その間だけを切り出して送れます(再エンコードしないので速く、画質も変わりません)。開始は、キーフレームに合わせて少し早くなることがあります。
 - **常駐版の状態とログ**: 常駐版が動いているか、版、`log.txt` の最後のほうを見られます。
 - 終了は、メニューで `+` か、「終了」です。送信中に `B` で、いま送っているファイルを止められます。
 
@@ -90,7 +93,7 @@ SDカードの中身はこうなります。
 
 | ログの内容 | 意味 |
 |---|---|
-| `main: start v1.2.1` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
+| `main: start v1.3.0` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
 | `network: 未接続` のまま | Wi-Fiにつながっていません |
 | `curl: global_init=0` 以外 | 通信ライブラリの初期化失敗 |
 | `postJson` / `postShot` の `http 200〜204` | 送信成功 |
