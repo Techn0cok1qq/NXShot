@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -17,39 +21,59 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ツールを入れる
-        run: apt-get update && apt-get install -y zip
+        run: apt-get update && apt-get install -y zip curl
 
       - name: 常駐版をビルド
         run: make -C sysmodule
 
-      - name: アプリ用のライブラリを入れる
-        run: |
-          # pkg.devkitpro.org が一時的に 403 を返すことがあるので、間隔をあけて最大6回リトライ
-          for i in 1 2 3 4 5 6; do
-            if dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl; then
-              exit 0
-            fi
-            echo "失敗($i/6)。$((i*20))秒待って再試行します"
-            sleep $((i*20))
-          done
-          exit 1
+      - name: ライブラリのキャッシュを戻す
+        id: libcache
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/devkitpro/portlibs
+          key: portlibs-sdl2-image-ttf-curl-ffmpeg-v1
 
-      - name: 動画プレビュー用の ffmpeg を入れる(入らなくてもビルドは続く)
+      - name: アプリ用のライブラリを入れる(キャッシュが無いときだけ)
+        id: libs
+        if: steps.libcache.outputs.cache-hit != 'true'
         run: |
-          # 入らなかった理由が分かるように、メッセージはそのまま表示する。403のときはリトライする
-          dkp-pacman -Ss ffmpeg || true
+          # pkg.devkitpro.org が403を返すことがあるので、間隔をあけてリトライする。
+          # 2回失敗したら、curlでブラウザの名前を名乗って取りにいく方法も試す。
+          enable_alt() {
+            CONF=/opt/devkitpro/pacman/etc/pacman.conf
+            if [ -f "$CONF" ] && ! grep -q '^XferCommand' "$CONF"; then
+              sed -i '/^\[options\]/a XferCommand = /usr/bin/curl -fL -A "Mozilla/5.0" -o %o %u' "$CONF"
+              echo "予備のダウンロード方法(curl)を有効にしました"
+            fi
+          }
           ok=0
-          for i in 1 2 3 4 5; do
-            if dkp-pacman -Syu --noconfirm switch-ffmpeg; then ok=1; break; fi
-            echo "ffmpegの取得に失敗($i/5)。$((i*20))秒待って再試行します"
+          for i in 1 2 3 4; do
+            if dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl; then ok=1; break; fi
+            echo "失敗($i/4)。$((i*30))秒待って再試行します"
+            if [ "$i" -ge 2 ]; then enable_alt; fi
+            sleep $((i*30))
+          done
+          [ "$ok" = 1 ] || exit 1
+          # 動画プレビュー用のffmpeg(入らなくてもビルドは続く)。データベースは上で取得済み
+          ff=0
+          for i in 1 2 3; do
+            if dkp-pacman -S --noconfirm switch-ffmpeg; then ff=1; break; fi
+            echo "ffmpegの取得に失敗($i/3)。$((i*20))秒待って再試行します"
             sleep $((i*20))
           done
-          if [ "$ok" = 1 ]; then
+          if [ "$ff" = 1 ]; then
             echo "switch-ffmpeg: インストール成功"
-            ls /opt/devkitpro/portlibs/switch/lib/pkgconfig | grep -i "libav\|libsw" || true
           else
             echo "::warning::switch-ffmpeg が入りませんでした。動画のプレビューなしでビルドします"
           fi
+          echo "ffmpeg=$ff" >> "$GITHUB_OUTPUT"
+
+      - name: ライブラリのキャッシュを保存(全部入ったときだけ)
+        if: steps.libs.outcome == 'success' && steps.libs.outputs.ffmpeg == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/devkitpro/portlibs
+          key: portlibs-sdl2-image-ttf-curl-ffmpeg-v1
 
       - name: アプリ(nro)をビルド
         run: |
