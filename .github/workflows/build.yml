@@ -60,6 +60,9 @@ jobs:
 
       - name: 配布用にまとめる
         run: |
+          # 版は app/Makefile の APP_VERSION から取る(zipの名前などに使う)
+          VER=$(sed -n 's/^APP_VERSION *:= *//p' app/Makefile | tr -d '\r ')
+          echo "VER=$VER" >> "$GITHUB_ENV"
           D=pkg/atmosphere/contents/4200000000000A7E
           mkdir -p $D/flags pkg/config/nxdiscord
           cp sysmodule/out/nxdiscord.nsp $D/exefs.nsp
@@ -68,15 +71,21 @@ jobs:
           touch $D/flags/boot2.flag
           printf '[ここにWebhook URLを貼る]\nlimit=10\nauto=1\n' > pkg/config/nxdiscord/config.txt
           cp README.md LICENSE CHANGELOG.md pkg/
-          (cd pkg && zip -qr ../NXShot-1.2.0.zip .)
+          (cd pkg && zip -qr ../NXShot-$VER.zip .)
+          # アプリのアップデート用に、単体のファイルも用意する
+          cp app/out/NXShot.nro NXShot.nro
+          cp sysmodule/out/nxdiscord.nsp nxdiscord.nsp
 
       - uses: actions/upload-artifact@v4
         with:
-          name: NXShot-1.2.0
+          name: NXShot-${{ env.VER }}
           path: pkg
 
       - name: Releaseに添付する
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: NXShot-1.2.0.zip
+          files: |
+            NXShot-${{ env.VER }}.zip
+            NXShot.nro
+            nxdiscord.nsp
