@@ -20,7 +20,7 @@ OUT      := out
 
 APP_TITLE   := NXShot
 APP_AUTHOR  := Cokacolastic
-APP_VERSION := 1.2.1
+APP_VERSION := 1.3.0
 
 PKGCONF  := $(DEVKITPRO)/portlibs/switch/bin/aarch64-none-elf-pkg-config
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
