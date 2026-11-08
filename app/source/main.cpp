@@ -578,8 +578,146 @@ static bool kbdInput(const char *header, const char *guide, const std::string &i
     return true;
 }
 
+// ---- 五十音表で文字を入力する(Switchのキーボードに日本語が出ないとき用) ----
+// 十字: 動かす  A: 入力  B: 1字消す  X: 濁点/半濁点  Y: 小さい字  ZL: 空白  ZR: Switchのキーボード
+// L/R: ページ(ひらがな/カタカナ/ABC/abc)  +: 決定  -: やめる
+static std::vector<std::string> kanaSplit(const std::string &s) {
+    std::vector<std::string> v;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        size_t n = c < 0x80 ? 1 : ((c >> 5) == 6 ? 2 : ((c >> 4) == 14 ? 3 : ((c >> 3) == 30 ? 4 : 1)));
+        if (i + n > s.size()) n = s.size() - i;
+        v.push_back(s.substr(i, n));
+        i += n;
+    }
+    return v;
+}
+
+static std::string kanaJoin(const std::vector<std::string> &t) {
+    std::string s;
+    for (auto &g : t) s += g;
+    return s;
+}
+
+// 最後の1字を、sets の中で次の字にする(例: か→が→か、は→ば→ぱ→は)。変えたら true
+static bool kanaCycle(std::vector<std::string> &t, const char *const *sets, int nsets) {
+    if (t.empty()) return false;
+    for (int i = 0; i < nsets; i++) {
+        std::vector<std::string> g = kanaSplit(sets[i]);
+        for (size_t k = 0; k < g.size(); k++) {
+            if (g[k] == t.back()) {
+                t.back() = g[(k + 1) % g.size()];
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// 10列 x 6行の表(行ごとに並べる)。空きは ""
+static void kanaPage(int page, std::vector<std::string> &cells) {
+    cells.assign(60, "");
+    if (page <= 1) {
+        static const char *HIRA[10] = {"あいうえお", "かきくけこ", "さしすせそ", "たちつてと", "なにぬねの",
+                                       "はひふへほ", "まみむめも", "や　ゆ　よ", "らりるれろ", "わをんー、"};
+        static const char *KATA[10] = {"アイウエオ", "カキクケコ", "サシスセソ", "タチツテト", "ナニヌネノ",
+                                       "ハヒフヘホ", "マミムメモ", "ヤ　ユ　ヨ", "ラリルレロ", "ワヲンー、"};
+        const char *const *cols = page == 0 ? HIRA : KATA;
+        for (int c = 0; c < 10; c++) {
+            std::vector<std::string> g = kanaSplit(cols[c]);
+            for (int r = 0; r < 5 && r < (int)g.size(); r++)
+                if (g[r] != "　") cells[r * 10 + c] = g[r];
+        }
+        std::vector<std::string> ex = kanaSplit("。！？〜…・「」（）");
+        for (int c = 0; c < 10 && c < (int)ex.size(); c++) cells[50 + c] = ex[c];
+    } else {
+        static const char *UP[6] = {"ABCDEFGHIJ", "KLMNOPQRST", "UVWXYZ0123", "456789.,!?", "-_@#&()+=:", "/*%~;<>[]|"};
+        static const char *LO[6] = {"abcdefghij", "klmnopqrst", "uvwxyz0123", "456789.,!?", "-_@#&()+=:", "/*%~;<>[]|"};
+        const char *const *rows = page == 2 ? UP : LO;
+        for (int r = 0; r < 6; r++)
+            for (int c = 0; c < 10; c++) cells[r * 10 + c] = std::string(1, rows[r][c]);
+    }
+}
+
+static bool kanaInput(const std::string &title, const std::string &init, int maxChars, std::string &out) {
+    static const char *DAKU[] = {"かが", "きぎ", "くぐ", "けげ", "こご", "さざ", "しじ", "すず", "せぜ", "そぞ", "ただ",
+                                 "ちぢ", "つづ", "てで", "とど", "はばぱ", "ひびぴ", "ふぶぷ", "へべぺ", "ほぼぽ", "うゔ",
+                                 "カガ", "キギ", "クグ", "ケゲ", "コゴ", "サザ", "シジ", "スズ", "セゼ", "ソゾ", "タダ",
+                                 "チヂ", "ツヅ", "テデ", "トド", "ハバパ", "ヒビピ", "フブプ", "ヘベペ", "ホボポ", "ウヴ"};
+    static const char *SMALL[] = {"あぁ", "いぃ", "うぅ", "えぇ", "おぉ", "つっ", "やゃ", "ゆゅ", "よょ", "わゎ", "アァ",
+                                  "イィ", "ウゥ", "エェ", "オォ", "ツッ", "ヤャ", "ユュ", "ヨョ", "ワヮ", "カヵ", "ケヶ"};
+    static const char *TABS[4] = {"ひらがな", "カタカナ", "ABC", "abc"};
+    const int nDaku = (int)(sizeof(DAKU) / sizeof(DAKU[0]));
+    const int nSmall = (int)(sizeof(SMALL) / sizeof(SMALL[0]));
+
+    std::vector<std::string> t = kanaSplit(init);
+    if ((int)t.size() > maxChars) t.resize(maxChars);
+    int page = 0, cx = 0, cy = 0;
+    std::vector<std::string> cells;
+    kanaPage(page, cells);
+
+    while (!g_quit && appletMainLoop()) {
+        beginFrame();
+        drawHeader(title);
+        // 入力中の文字(長いときは、後ろのほうだけ見せる)
+        drawCard(36, 90, 1208, 96);
+        {
+            std::vector<std::string> tail = t;
+            while (!tail.empty() && textW(fTitle, kanaJoin(tail) + "|") > 1020) tail.erase(tail.begin());
+            if (t.empty()) drawTextMid(64, 138, "文字を選んでください", fBody, C_DIM);
+            else drawTextMid(64, 138, kanaJoin(tail) + "|", fTitle, C_TEXT);
+            drawTextMid(1216, 138, std::to_string(t.size()) + " / " + std::to_string(maxChars), fSmall, C_DIM, 1);
+        }
+        // ページ
+        for (int i = 0; i < 4; i++) {
+            int x = 36 + i * 132;
+            fillRRect(x, 202, 122, 34, 9, i == page ? C_ACC : C_CARD2);
+            drawTextMid(x + 61, 219, TABS[i], fSmall, i == page ? C_WHITE : C_DIM, 2);
+        }
+        // 表
+        const int gx = 100, gy = 250, cw = 108, ch = 64;
+        for (int r = 0; r < 6; r++) {
+            for (int c = 0; c < 10; c++) {
+                int x = gx + c * cw, y = gy + r * ch;
+                bool sel = (r == cy && c == cx);
+                fillRRect(x, y, cw - 6, ch - 6, 10, sel ? C_ACC : C_CARD);
+                const std::string &g = cells[(size_t)r * 10 + c];
+                if (!g.empty()) drawTextMid(x + (cw - 6) / 2, y + (ch - 6) / 2, g, fTitle, sel ? C_WHITE : C_TEXT, 2);
+            }
+        }
+        drawFooter("A: 入力  B: 消す  X: 濁点  Y: 小  ZL: 空白  ZR: 本体KB  L/R: ページ  +: 決定  -: やめる");
+        endFrame();
+
+        if (pressed(BT_LEFT)) cx = (cx + 9) % 10;
+        if (pressed(BT_RIGHT)) cx = (cx + 1) % 10;
+        if (pressed(BT_UP)) cy = (cy + 5) % 6;
+        if (pressed(BT_DOWN)) cy = (cy + 1) % 6;
+        if (pressed(BT_L)) { page = (page + 3) % 4; kanaPage(page, cells); }
+        if (pressed(BT_R)) { page = (page + 1) % 4; kanaPage(page, cells); }
+        if (pressed(BT_A)) {
+            const std::string &g = cells[(size_t)cy * 10 + cx];
+            if (!g.empty() && (int)t.size() < maxChars) t.push_back(g);
+        }
+        if (pressed(BT_B) && !t.empty()) t.pop_back();
+        if (pressed(BT_X)) kanaCycle(t, DAKU, nDaku);
+        if (pressed(BT_Y)) kanaCycle(t, SMALL, nSmall);
+        if (pressed(BT_ZL) && (int)t.size() < maxChars) t.push_back(" ");
+        if (pressed(BT_ZR)) {
+            std::string o;
+            if (kbdInput(title.c_str(), "文字を入れる", kanaJoin(t), maxChars, false, o)) {
+                t = kanaSplit(o);
+                if ((int)t.size() > maxChars) t.resize(maxChars);
+            }
+        }
+        if (pressed(BT_MINUS)) return false;
+        if (pressed(BT_PLUS) && !t.empty()) { out = kanaJoin(t); return true; }
+        SDL_Delay(16);
+    }
+    return false;
+}
+
 // 文字入れ用の入力。config/nxdiscord/text.txt があって、いまの文字と違えば、その1行目を使う
-// (Switchのキーボードに日本語が無いとき用。UTF-8で保存する)。それ以外はSwitchのキーボードを開く
+// (UTF-8で保存する)。それ以外は、五十音表の入力画面を開く(ZRで、Switchのキーボードも使える)
 static bool textInput(const char *header, const char *guide, const std::string &init, int maxLen, std::string &out) {
     FILE *f = fopen(EDIT_TEXT_PATH, "rb");
     if (f) {
@@ -597,7 +735,8 @@ static bool textInput(const char *header, const char *guide, const std::string &
             return true;
         }
     }
-    return kbdInput(header, guide, init, maxLen, false, out);
+    (void)guide;
+    return kanaInput(header, init, maxLen, out);
 }
 
 // ====================================================================
