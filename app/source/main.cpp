@@ -851,21 +851,33 @@ struct VDec {
     int vs = -1;
     double tb = 0;
 
+    static void errLog(const char *what, const char *path, int r) {
+        char eb[128] = "";
+        if (r < 0) av_strerror(r, eb, sizeof eb);
+        applog("ffmpeg: %s %s (%d: %s)", what, path, r, eb);
+    }
+
     bool open(const char *path, int threads) {
-        if (avformat_open_input(&fmt, path, nullptr, nullptr) < 0) { fmt = nullptr; return false; }
-        if (avformat_find_stream_info(fmt, nullptr) < 0) return false;
+        // "sdmc:/..." のままだと ffmpeg が "sdmc" をプロトコル名と勘違いして開けないので、file: をつける
+        std::string url = std::string("file:") + path;
+        int r = avformat_open_input(&fmt, url.c_str(), nullptr, nullptr);
+        if (r < 0) { fmt = nullptr; errLog("ファイルを開けません", path, r); return false; }
+        r = avformat_find_stream_info(fmt, nullptr);
+        if (r < 0) { errLog("動画の情報を読めません", path, r); return false; }
         vs = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
-        if (vs < 0) return false;
+        if (vs < 0) { errLog("映像がありません", path, vs); return false; }
         for (unsigned i = 0; i < fmt->nb_streams; i++)
             if ((int)i != vs) fmt->streams[i]->discard = AVDISCARD_ALL;  // 音声は読まない
         AVStream *st = fmt->streams[vs];
         const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
-        if (!codec) return false;
+        if (!codec) { applog("ffmpeg: デコーダがありません codec_id=%d %s", (int)st->codecpar->codec_id, path); return false; }
         ctx = avcodec_alloc_context3(codec);
         if (!ctx) return false;
-        if (avcodec_parameters_to_context(ctx, st->codecpar) < 0) return false;
+        r = avcodec_parameters_to_context(ctx, st->codecpar);
+        if (r < 0) { errLog("パラメータ設定に失敗", path, r); return false; }
         if (threads > 1) { ctx->thread_count = threads; ctx->thread_type = FF_THREAD_FRAME; }
-        if (avcodec_open2(ctx, codec, nullptr) < 0) return false;
+        r = avcodec_open2(ctx, codec, nullptr);
+        if (r < 0) { errLog("デコーダを開けません", path, r); return false; }
         frame = av_frame_alloc();
         pkt = av_packet_alloc();
         if (!frame || !pkt) return false;
