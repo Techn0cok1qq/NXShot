@@ -32,14 +32,18 @@ extern "C" {
 }
 #endif
 #include "../../sysmodule/source/mp4trim.h"
+#include "imgops.h"
 
-#define APP_VERSION_STR "1.2.1"
+#define APP_VERSION_STR "1.3.0"
 #define CONFIG_DIR "sdmc:/config/nxdiscord"
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define SYS_LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define APP_LOG_PATH "sdmc:/config/nxdiscord/app_log.txt"
 #define SENT_PATH "sdmc:/config/nxdiscord/app_sent.txt"
 #define TRIM_TMP_PATH "sdmc:/config/nxdiscord/trim_tmp_app.mp4"
+#define EDIT_DIR "sdmc:/config/nxdiscord/edit"            // 編集した写真・切り出した動画の置き場(送ったら消える)
+#define EDIT_FONT_DIR "sdmc:/config/nxdiscord/fonts"      // 自分で入れたフォント(.ttf .otf .ttc)
+#define EDIT_VIDEO_PATH EDIT_DIR "/cut_tmp.mp4"
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define DEFAULT_LIMIT_MB 10
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
@@ -830,6 +834,8 @@ struct Item {
     long long size = -1;  // -1: まだ調べていない(たくさんあるときに、開くのが遅くならないよう、見えるときに調べる)
     bool sel = false;
     bool sent = false;
+    std::string edited;    // 編集したファイル(あれば、元のかわりにこれを送る。送ったら消す)
+    std::string editNote;  // 編集したことのメモ(Discordの文に足す)
 };
 
 static long long itemSize(Item &it) {
@@ -886,8 +892,13 @@ enum { SR_OK = 0, SR_SKIP = 1, SR_FAIL = 2, SR_CANCEL = 3 };
 
 static int sendOne(Item &it, std::string &msg) {
     bool isVideo = it.kind == MK_VIDEO;
+    std::string srcPath = it.edited.empty() ? it.full : it.edited;  // 編集したものがあれば、それを送る
     long long itSize = itemSize(it);
-    std::string sendPath = it.full;
+    if (!it.edited.empty()) {
+        struct stat est;
+        itSize = (stat(srcPath.c_str(), &est) == 0) ? (long long)est.st_size : 0;
+    }
+    std::string sendPath = srcPath;
     std::string note;
     bool trimmed = false;
     long long limitBytes = (long long)g_cfg.limitMB * 1048576LL - 65536;
@@ -900,7 +911,7 @@ static int sendOne(Item &it, std::string &msg) {
             g_view.frac = 0;
             drawSending();
             applog("trim: 開始 %s (%lld bytes, 上限 %lld)", it.name.c_str(), itSize, limitBytes);
-            tr = mp4trim::trim(it.full.c_str(), TRIM_TMP_PATH, limitBytes, &ti);
+            tr = mp4trim::trim(srcPath.c_str(), TRIM_TMP_PATH, limitBytes, &ti);
             applog("trim: result=%d new=%lld cut=%.2fs", (int)tr, (long long)ti.newSize, ti.cutSeconds);
         }
         if (tr == mp4trim::OK) {
@@ -912,17 +923,23 @@ static int sendOne(Item &it, std::string &msg) {
             note = nb;
         } else {
             remove(TRIM_TMP_PATH);
+            if (!it.edited.empty()) { remove(it.edited.c_str()); it.edited.clear(); }
             msg = "上限(" + std::to_string(g_cfg.limitMB) + "MB)を超えるため送りませんでした(" + fmtMB(itSize) + ")";
             return SR_SKIP;
         }
     }
 
+    bool isPng = !isVideo && sendPath.size() > 4 && sendPath.compare(sendPath.size() - 4, 4, ".png") == 0;
+    const char *fileName = isVideo ? "video.mp4" : (isPng ? "screenshot.png" : "screenshot.jpg");
+    const char *mime = isVideo ? "video/mp4" : (isPng ? "image/png" : "image/jpeg");
+
     std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" +
                           (isVideo ? "🎬 動画" : "📸 スクリーンショット") + "\"";
     std::string desc = "あとから送信(撮影 " + timeLabel(it.name, true) + ")";
+    if (!it.editNote.empty()) desc += "\n" + it.editNote;
     if (!note.empty()) desc += "\n" + note;
     payload += ",\"description\":\"" + jsonEscape(desc) + "\",\"color\":15277667";
-    if (!isVideo) payload += ",\"image\":{\"url\":\"attachment://screenshot.jpg\"}";
+    if (!isVideo) payload += std::string(",\"image\":{\"url\":\"attachment://") + fileName + "\"}";
     payload += "}]}";
 
     struct stat sst;
@@ -935,18 +952,19 @@ static int sendOne(Item &it, std::string &msg) {
                         (attempt > 1 ? " やり直し " + std::to_string(attempt) + "回目" : "");
         g_view.frac = 0;
         drawSending();
-        code = postFile(g_cfg.hook, payload, sendPath, isVideo ? "video.mp4" : "screenshot.jpg",
-                        isVideo ? "video/mp4" : "image/jpeg", timeoutSec);
+        code = postFile(g_cfg.hook, payload, sendPath, fileName, mime, timeoutSec);
         if (g_cancel || g_quit) break;
         if (code >= 200 && code < 300) break;
         if (code != -1) break;  // 通信エラー以外は、やり直しても同じ
     }
     if (trimmed) remove(TRIM_TMP_PATH);
+    bool wasEdited = !it.edited.empty();
+    if (wasEdited && (code >= 200 && code < 300)) { remove(it.edited.c_str()); it.edited.clear(); }
 
     if (g_cancel || g_quit) { msg = "中止しました"; return SR_CANCEL; }
     if (code >= 200 && code < 300) {
         addSent(it.name);
-        msg = note.empty() ? "送りました" : "送りました(最初を削りました)";
+        msg = !note.empty() ? "送りました(最初を削りました)" : (wasEdited ? "編集したものを送りました" : "送りました");
         return SR_OK;
     }
     msg = httpHint(code);
@@ -1145,6 +1163,21 @@ struct VDec {
         avcodec_flush_buffers(ctx);
     }
 
+    // sec の位置(以降で最初のコマ)まで進めて、frame に入れる。取れたら true
+    bool seekTo(double sec) {
+        if (sec < 0) sec = 0;
+        int64_t ts = (int64_t)(sec / tb);
+        if (av_seek_frame(fmt, vs, ts, AVSEEK_FLAG_BACKWARD) < 0) return false;
+        avcodec_flush_buffers(ctx);
+        for (int guard = 0; guard < 600; guard++) {
+            int r = next();
+            if (r != 1) return false;
+            double p = ptsSec();
+            if (p < 0 || p >= sec - 0.0005) return true;
+        }
+        return false;
+    }
+
     void close() {
         if (sws) { sws_freeContext(sws); sws = nullptr; }
         if (frame) av_frame_free(&frame);
@@ -1296,6 +1329,608 @@ static void previewInfoBar(Item &it) {
     drawText(48, 618, fitText(fSmall, d, 1180), fSmall, it.sel ? C_OK : C_TEXT);
 }
 
+// ====================================================================
+// 編集(写真: 切り抜き・文字・ぼかし・モザイク・モーションブラー / 動画: 長さを選んで切る)
+// ====================================================================
+static void *g_fontMem = nullptr;  // Switchの共有フォント(文字入れに使う)
+static int g_fontLen = 0;
+
+static bool imgFromFile(const std::string &path, imgops::Img &im) {
+    SDL_Surface *s0 = IMG_Load(path.c_str());
+    if (!s0) return false;
+    SDL_Surface *s = SDL_ConvertSurfaceFormat(s0, SDL_PIXELFORMAT_RGBA32, 0);
+    SDL_FreeSurface(s0);
+    if (!s) return false;
+    bool ok = s->w > 0 && s->h > 0;
+    if (ok) {
+        im.alloc(s->w, s->h);
+        for (int y = 0; y < s->h; y++) memcpy(im.at(0, y), (unsigned char *)s->pixels + (size_t)y * s->pitch, (size_t)s->w * 4);
+    }
+    SDL_FreeSurface(s);
+    return ok;
+}
+
+// 画像をjpgで保存する(だめならpng)。basePath は拡張子なし。保存できたら、実際のファイル名を outPath に入れる
+static bool imgSave(const imgops::Img &im, const std::string &basePath, std::string &outPath) {
+    SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, im.w, im.h, 24, SDL_PIXELFORMAT_RGB24);
+    if (!s) return false;
+    for (int y = 0; y < im.h; y++) {
+        unsigned char *d = (unsigned char *)s->pixels + (size_t)y * s->pitch;
+        const unsigned char *r = im.at(0, y);
+        for (int x = 0; x < im.w; x++) { d[x * 3] = r[x * 4]; d[x * 3 + 1] = r[x * 4 + 1]; d[x * 3 + 2] = r[x * 4 + 2]; }
+    }
+    bool ok = false;
+    std::string jp = basePath + ".jpg";
+    if (IMG_SaveJPG(s, jp.c_str(), 92) == 0) { outPath = jp; ok = true; }
+    else {
+        std::string pn = basePath + ".png";
+        if (IMG_SavePNG(s, pn.c_str()) == 0) { outPath = pn; ok = true; }
+    }
+    SDL_FreeSurface(s);
+    return ok;
+}
+
+struct EdFont { std::string label, path; };  // path が空なら、Switchの標準フォント
+
+static std::vector<EdFont> edFonts() {
+    std::vector<EdFont> v;
+    v.push_back({"標準", ""});
+    std::vector<std::string> dirs, files;
+    listDir(EDIT_FONT_DIR, dirs, files);
+    std::sort(files.begin(), files.end());
+    for (auto &f : files) {
+        if (f.size() < 5) continue;
+        std::string ext = f.substr(f.size() - 4);
+        for (auto &ch : ext) ch = (char)tolower((unsigned char)ch);
+        if (ext != ".ttf" && ext != ".otf" && ext != ".ttc") continue;
+        if (v.size() >= 13) break;
+        std::string label = f.substr(0, f.size() - 4);
+        v.push_back({label, std::string(EDIT_FONT_DIR) + "/" + f});
+    }
+    return v;
+}
+
+static TTF_Font *openEdFont(const EdFont &f, int px, int style) {
+    TTF_Font *t = nullptr;
+    if (f.path.empty()) {
+        if (!g_fontMem) return nullptr;
+        t = TTF_OpenFontRW(SDL_RWFromMem(g_fontMem, g_fontLen), 1, px);
+    } else {
+        t = TTF_OpenFont(f.path.c_str(), px);
+    }
+    if (t) TTF_SetFontStyle(t, style);
+    return t;
+}
+
+// 文字を、白で描いた画像のアルファだけを取り出して、型紙にする
+static bool makeTextMask(const EdFont &f, int px, int style, const std::string &text, imgops::Mask &m) {
+    TTF_Font *t = openEdFont(f, px, style);
+    if (!t) return false;
+    SDL_Color white = {255, 255, 255, 255};
+    SDL_Surface *s0 = TTF_RenderUTF8_Blended(t, text.c_str(), white);
+    TTF_CloseFont(t);
+    if (!s0) return false;
+    SDL_Surface *s = SDL_ConvertSurfaceFormat(s0, SDL_PIXELFORMAT_RGBA32, 0);
+    SDL_FreeSurface(s0);
+    if (!s) return false;
+    m.w = s->w;
+    m.h = s->h;
+    m.a.assign((size_t)m.w * m.h, 0);
+    for (int y = 0; y < s->h; y++) {
+        const unsigned char *row = (const unsigned char *)s->pixels + (size_t)y * s->pitch;
+        for (int x = 0; x < s->w; x++) m.a[(size_t)y * m.w + x] = row[x * 4 + 3];
+    }
+    SDL_FreeSurface(s);
+    return m.w > 0 && m.h > 0;
+}
+
+static const unsigned char ED_PAL[8][3] = {{255, 255, 255}, {20, 20, 24}, {235, 60, 60}, {255, 222, 64},
+                                          {80, 220, 120}, {70, 200, 240}, {88, 101, 242}, {255, 120, 190}};
+static const char *ED_PAL_NAME[8] = {"白", "黒", "赤", "黄", "緑", "水色", "青", "ピンク"};
+
+enum { TL_CROP = 0, TL_TEXT, TL_BLUR, TL_MOSAIC, TL_MOTION, TL_UNDO, TL_SEND, TL_SAVE, TL_EXIT, TL_N };
+enum { ED_MENU = 0, ED_REGION = 1, ED_TEXT = 2 };
+
+// 右パネルの「キー + 説明 + 今の値」の1行
+static void drawKeyRow(int x, int cy, int w, const std::string &key, const std::string &label, const std::string &value) {
+    int kw = std::max(30, textW(fSmall, key) + 18);
+    fillRRect(x, cy - 13, kw, 26, 7, SDL_Color{70, 75, 104, 255});
+    drawTextMid(x + kw / 2, cy, key, fSmall, C_WHITE, 2);
+    drawTextMid(x + kw + 10, cy, label, fSmall, C_TEXT);
+    if (!value.empty()) drawTextMid(x + w, cy, value, fSmall, C_ACC2, 1);
+}
+
+static std::string fileStem(const std::string &name) {
+    size_t p = name.rfind('.');
+    return p == std::string::npos ? name : name.substr(0, p);
+}
+
+// 戻り値: 送れたら true
+static bool screenPhotoEdit(Item &it) {
+    mkdir(EDIT_DIR, 0777);
+    imgops::Img base;
+    if (!imgFromFile(it.full, base)) {
+        showMessage("写真を開けませんでした", {it.name}, false);
+        return false;
+    }
+    std::vector<imgops::Img> undo;
+    imgops::Img view = base;
+    SDL_Texture *tex = nullptr;
+    int texW = 0, texH = 0;
+    auto upload = [&]() {
+        if (!tex || texW != view.w || texH != view.h) {
+            if (tex) SDL_DestroyTexture(tex);
+            tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, view.w, view.h);
+            texW = view.w;
+            texH = view.h;
+        }
+        if (tex) SDL_UpdateTexture(tex, nullptr, view.px.data(), view.w * 4);
+    };
+    upload();
+
+    int mode = ED_MENU, cur = 0, tool = TL_CROP;
+    imgops::Rect rg;
+    bool sizeMode = false, dirty = false;
+    int param = 0, angle = 0;
+    std::vector<EdFont> fonts = edFonts();
+    int fontIdx = 0, style = 0, tsize = 64, colIdx = 0, outl = 1, tx = 0, ty = 0;
+    std::string text;
+    imgops::Mask tmask;
+    bool maskDirty = false;
+    int edits = 0;
+    std::string toast;
+    Uint32 toastUntil = 0;
+    bool exitArmed = false;
+    bool sentOk = false;
+    auto say = [&](const std::string &m) { toast = m; toastUntil = SDL_GetTicks() + 2500; };
+    auto pushUndo = [&]() {
+        undo.push_back(base);
+        if (undo.size() > 6) undo.erase(undo.begin());
+        edits++;
+    };
+    auto startRegion = [&](int t) {
+        tool = t;
+        mode = ED_REGION;
+        sizeMode = false;
+        rg.w = base.w / 2;
+        rg.h = base.h / 2;
+        rg.x = (base.w - rg.w) / 2;
+        rg.y = (base.h - rg.h) / 2;
+        param = t == TL_BLUR ? 10 : (t == TL_MOSAIC ? 16 : (t == TL_MOTION ? 30 : 0));
+        angle = 0;
+        dirty = true;
+    };
+    auto applyEffect = [&](imgops::Img &im) {
+        if (tool == TL_BLUR) imgops::boxBlur(im, rg, param, 3);
+        else if (tool == TL_MOSAIC) imgops::mosaic(im, rg, param);
+        else if (tool == TL_MOTION) imgops::motionBlur(im, rg, param, angle);
+    };
+    // 保存して、ファイルの場所を返す
+    auto saveTo = [&](const std::string &basePath, std::string &outPath) -> bool {
+        drawStatusScreen("写真の編集", "画像を保存しています...");
+        return imgSave(base, basePath, outPath);
+    };
+
+    while (!g_quit && appletMainLoop()) {
+        beginFrame();
+        drawHeader("写真の編集");
+
+        // ---- 状態の更新 ----
+        if (mode == ED_REGION && dirty) {
+            view = base;
+            if (tool != TL_CROP) applyEffect(view);
+            upload();
+            dirty = false;
+        } else if (mode == ED_TEXT && (dirty || maskDirty)) {
+            if (maskDirty) {
+                if (!makeTextMask(fonts[fontIdx], tsize, style, text, tmask)) tmask = imgops::Mask();
+                maskDirty = false;
+            }
+            view = base;
+            if (tmask.w > 0) {
+                int op = outl == 0 ? 0 : (outl == 1 ? std::max(1, tsize / 20) : std::max(2, tsize / 9));
+                const unsigned char *c = ED_PAL[colIdx];
+                unsigned char oc[3] = {20, 20, 24};
+                if ((c[0] * 3 + c[1] * 6 + c[2]) / 10 < 90) { oc[0] = oc[1] = oc[2] = 245; }
+                imgops::drawTextMask(view, tmask, tx, ty, c, op, oc);
+            }
+            upload();
+            dirty = false;
+        }
+
+        // ---- 画像 ----
+        fillRRect(36, 92, 840, 472, 12, SDL_Color{10, 11, 17, 235});
+        double sc = std::min(824.0 / view.w, 456.0 / view.h);
+        int dw = std::max(1, (int)(view.w * sc)), dh = std::max(1, (int)(view.h * sc));
+        SDL_Rect dst = {36 + (840 - dw) / 2, 92 + (472 - dh) / 2, dw, dh};
+        if (tex) SDL_RenderCopy(g_ren, tex, nullptr, &dst);
+        if (mode == ED_REGION) {
+            int rx = dst.x + (int)(rg.x * sc), ry = dst.y + (int)(rg.y * sc);
+            int rw = std::max(2, (int)(rg.w * sc)), rh = std::max(2, (int)(rg.h * sc));
+            if (tool == TL_CROP) {  // 外側を暗くする
+                SDL_Color dim = {0, 0, 0, 150};
+                fillRect(dst.x, dst.y, dst.w, ry - dst.y, dim);
+                fillRect(dst.x, ry + rh, dst.w, dst.y + dst.h - (ry + rh), dim);
+                fillRect(dst.x, ry, rx - dst.x, rh, dim);
+                fillRect(rx + rw, ry, dst.x + dst.w - (rx + rw), rh, dim);
+            }
+            SDL_Color fc = sizeMode ? C_WARN : C_ACC2;
+            fillRect(rx, ry, rw, 2, fc);
+            fillRect(rx, ry + rh - 2, rw, 2, fc);
+            fillRect(rx, ry, 2, rh, fc);
+            fillRect(rx + rw - 2, ry, 2, rh, fc);
+            fillRRect(rx + rw - 8, ry + rh - 8, 12, 12, 3, fc);  // 大きさを変える角
+        }
+        std::string info = std::to_string(view.w) + " × " + std::to_string(view.h) + "    編集 " + std::to_string(edits) + "回";
+        drawText(48, 574, info, fSmall, C_DIM);
+        if (SDL_GetTicks() < toastUntil) drawText(868, 574, toast, fSmall, C_WARN, 1);
+
+        // ---- 右のパネル ----
+        drawCard(896, 92, 348, 472);
+        if (mode == ED_MENU) {
+            const char *names[TL_N] = {"切り抜き", "文字を入れる", "ぼかし", "モザイク", "モーションブラー",
+                                       "ひとつ戻す", "これを送る", "保存して続ける", "編集をやめる"};
+            for (int i = 0; i < TL_N; i++) {
+                int y = 104 + i * 50;
+                bool sel = i == cur;
+                if (sel) {
+                    fillRRect(908, y, 324, 44, 10, C_ACC);
+                    strokeRRect(908, y, 324, 44, 10, 2, C_ACC2);
+                }
+                drawTextMid(928, y + 22, names[i], fBody, sel ? C_WHITE : (i == TL_SEND ? C_OK : C_TEXT));
+            }
+            drawFooter("上下: 選ぶ  A: 決定  B: 戻る");
+        } else if (mode == ED_REGION) {
+            const char *tn[] = {"切り抜き", "", "ぼかし", "モザイク", "モーションブラー"};
+            drawText(916, 104, tn[tool], fTitle, C_TEXT);
+            char b[80];
+            snprintf(b, sizeof(b), "範囲  %d,%d   %d × %d", rg.x, rg.y, rg.w, rg.h);
+            drawText(916, 152, b, fSmall, C_DIM);
+            int y = 206;
+            drawKeyRow(916, y, 312, "十字", sizeMode ? "大きさを変える" : "動かす", "");
+            y += 44;
+            drawKeyRow(916, y, 312, "X", "動かす/大きさ", sizeMode ? "大きさ" : "動かす");
+            y += 44;
+            if (tool != TL_CROP) {
+                const char *pn = tool == TL_BLUR ? "強さ" : (tool == TL_MOSAIC ? "ブロック" : "長さ");
+                drawKeyRow(916, y, 312, "L/R", pn, std::to_string(param));
+                y += 44;
+            }
+            if (tool == TL_MOTION) {
+                drawKeyRow(916, y, 312, "Y", "向き(15度ずつ)", std::to_string(angle) + "度");
+                y += 44;
+            }
+            drawKeyRow(916, y, 312, "ZR", "押しながら: 速く", "");
+            drawFooter("十字: 動かす  X: 切り替え  L/R: 強さ  A: 決定  B: やめる");
+        } else {
+            drawText(916, 104, "文字を入れる", fTitle, C_TEXT);
+            drawText(916, 150, fitText(fSmall, "「" + text + "」", 312), fSmall, C_DIM);
+            int y = 196;
+            drawKeyRow(916, y, 312, "十字", "動かす", "");
+            y += 42;
+            drawKeyRow(916, y, 312, "L/R", "大きさ", std::to_string(tsize));
+            y += 42;
+            drawKeyRow(916, y, 312, "Y", "色", ED_PAL_NAME[colIdx]);
+            y += 42;
+            drawKeyRow(916, y, 312, "X", "フォント", fitText(fSmall, fonts[fontIdx].label, 130));
+            y += 42;
+            drawKeyRow(916, y, 312, "ZL", "ふちどり", outl == 0 ? "なし" : (outl == 1 ? "ふつう" : "太い"));
+            y += 42;
+            const char *sn[] = {"ふつう", "太字", "斜体", "太字+斜体"};
+            drawKeyRow(916, y, 312, "+", "字の形", sn[style & 3]);
+            y += 42;
+            drawKeyRow(916, y, 312, "-", "文字を直す", "");
+            y += 42;
+            drawKeyRow(916, y, 312, "ZR", "押しながら: 速く", "");
+            drawFooter("十字: 動かす  L/R: 大きさ  A: 決定  B: やめる");
+        }
+        endFrame();
+
+        // ---- 操作 ----
+        int step = std::max(2, base.w / 160) * (g_cur[BT_ZR] ? 4 : 1);
+        if (mode == ED_MENU) {
+            if (pressed(BT_DOWN)) { cur = (cur + 1) % TL_N; exitArmed = false; }
+            if (pressed(BT_UP)) { cur = (cur + TL_N - 1) % TL_N; exitArmed = false; }
+            bool back = pressed(BT_B);
+            if (back && edits == 0) break;
+            if (back && edits > 0) {
+                if (exitArmed) break;
+                exitArmed = true;
+                say("もう一度 B で、編集を捨てて戻ります");
+            }
+            if (pressed(BT_A)) {
+                switch (cur) {
+                    case TL_CROP:
+                    case TL_BLUR:
+                    case TL_MOSAIC:
+                    case TL_MOTION: startRegion(cur); break;
+                    case TL_TEXT: {
+                        std::string out;
+                        if (kbdInput("文字を入れる", "写真に入れる文字", text, 60, false, out) && !out.empty()) {
+                            text = out;
+                            mode = ED_TEXT;
+                            tx = base.w / 8;
+                            ty = base.h / 2;
+                            maskDirty = true;
+                            dirty = true;
+                        }
+                        break;
+                    }
+                    case TL_UNDO:
+                        if (!undo.empty()) {
+                            base = undo.back();
+                            undo.pop_back();
+                            edits--;
+                            view = base;
+                            upload();
+                            say("ひとつ戻しました");
+                        } else say("戻せる編集がありません");
+                        break;
+                    case TL_SEND: {
+                        std::string path;
+                        if (!saveTo(std::string(EDIT_DIR) + "/send_tmp", path)) { showMessage("保存できませんでした", {"SDカードの空きを確かめてください"}, false); break; }
+                        Item e = it;
+                        e.edited = path;
+                        e.editNote = edits > 0 ? "(編集あり)" : "";
+                        std::vector<Item> v{e};
+                        runSend(v, {0});
+                        if (!v[0].edited.empty()) remove(v[0].edited.c_str());
+                        if (v[0].sent) { it.sent = true; sentOk = true; }
+                        break;
+                    }
+                    case TL_SAVE: {
+                        std::string path;
+                        if (!saveTo(std::string(EDIT_DIR) + "/" + fileStem(it.name) + "_edit", path)) { showMessage("保存できませんでした", {"SDカードの空きを確かめてください"}, false); break; }
+                        showMessage("保存しました", {path}, true);
+                        break;
+                    }
+                    default:
+                        if (edits == 0) { mode = -1; }
+                        else if (exitArmed) { mode = -1; }
+                        else { exitArmed = true; say("もう一度 A で、編集を捨てて戻ります"); }
+                        break;
+                }
+                if (mode == -1) break;
+                if (sentOk) break;
+            }
+        } else if (mode == ED_REGION) {
+            int dx = (pressed(BT_RIGHT) ? 1 : 0) - (pressed(BT_LEFT) ? 1 : 0);
+            int dy = (pressed(BT_DOWN) ? 1 : 0) - (pressed(BT_UP) ? 1 : 0);
+            if (dx || dy) {
+                if (sizeMode) {
+                    rg.w = std::min(base.w - rg.x, std::max(16, rg.w + dx * step));
+                    rg.h = std::min(base.h - rg.y, std::max(16, rg.h + dy * step));
+                } else {
+                    rg.x = std::min(base.w - rg.w, std::max(0, rg.x + dx * step));
+                    rg.y = std::min(base.h - rg.h, std::max(0, rg.y + dy * step));
+                }
+                dirty = true;
+            }
+            if (pressed(BT_X)) sizeMode = !sizeMode;
+            if (tool != TL_CROP) {
+                int pd = (pressed(BT_R) ? 1 : 0) - (pressed(BT_L) ? 1 : 0);
+                if (pd) {
+                    int lo = tool == TL_BLUR ? 2 : (tool == TL_MOSAIC ? 4 : 4);
+                    int hi = tool == TL_BLUR ? 60 : (tool == TL_MOSAIC ? 96 : 160);
+                    int st = tool == TL_BLUR ? 2 : 4;
+                    param = std::min(hi, std::max(lo, param + pd * st));
+                    dirty = true;
+                }
+            }
+            if (tool == TL_MOTION && pressed(BT_Y)) { angle = (angle + 15) % 180; dirty = true; }
+            if (pressed(BT_B)) { mode = ED_MENU; view = base; upload(); }
+            else if (pressed(BT_A)) {
+                if (tool == TL_CROP) {
+                    imgops::Img out;
+                    if (imgops::crop(base, rg, out)) {
+                        pushUndo();
+                        base = out;
+                        say("切り抜きました");
+                    }
+                } else {
+                    pushUndo();
+                    applyEffect(base);
+                }
+                view = base;
+                upload();
+                mode = ED_MENU;
+            }
+        } else {  // ED_TEXT
+            int dx = (pressed(BT_RIGHT) ? 1 : 0) - (pressed(BT_LEFT) ? 1 : 0);
+            int dy = (pressed(BT_DOWN) ? 1 : 0) - (pressed(BT_UP) ? 1 : 0);
+            if (dx || dy) {
+                tx = std::min(std::max(0, base.w - tmask.w), std::max(0, tx + dx * step));
+                ty = std::min(std::max(0, base.h - tmask.h), std::max(0, ty + dy * step));
+                dirty = true;
+            }
+            int sd = (pressed(BT_R) ? 1 : 0) - (pressed(BT_L) ? 1 : 0);
+            if (sd) {
+                tsize = std::min(300, std::max(16, tsize + sd * (g_cur[BT_ZR] ? 16 : 4)));
+                maskDirty = true;
+            }
+            if (pressed(BT_Y)) { colIdx = (colIdx + 1) % 8; dirty = true; }
+            if (pressed(BT_X)) { fontIdx = (fontIdx + 1) % (int)fonts.size(); maskDirty = true; }
+            if (pressed(BT_ZL)) { outl = (outl + 1) % 3; dirty = true; }
+            if (pressed(BT_PLUS)) { style = (style + 1) % 4; maskDirty = true; }
+            if (pressed(BT_MINUS)) {
+                std::string out;
+                if (kbdInput("文字を直す", "写真に入れる文字", text, 60, false, out) && !out.empty()) { text = out; maskDirty = true; }
+            }
+            if (pressed(BT_B)) { mode = ED_MENU; view = base; upload(); }
+            else if (pressed(BT_A)) {
+                if (tmask.w > 0) { pushUndo(); base = view; say("文字を入れました"); }
+                view = base;
+                upload();
+                mode = ED_MENU;
+            }
+        }
+        SDL_Delay(8);
+    }
+    if (tex) SDL_DestroyTexture(tex);
+    return sentOk;
+}
+
+// 動画の長さを選んで切る
+static std::string fmtTime(double sec) {
+    if (sec < 0) sec = 0;
+    int m = (int)(sec / 60);
+    double s = sec - m * 60;
+    char b[32];
+    snprintf(b, sizeof(b), "%d:%04.1f", m, s);
+    return b;
+}
+
+static bool screenVideoTrim(Item &it) {
+    mkdir(EDIT_DIR, 0777);
+    mp4trim::Probe P;
+    mp4trim::Result pr = mp4trim::probe(it.full.c_str(), P);
+    if (pr != mp4trim::OK || P.duration < 1.0) {
+        showMessage("この動画は切り取れません", {"動画の構造が、対応していない形かもしれません(コード " + std::to_string((int)pr) + ")"}, false);
+        return false;
+    }
+    double dur = P.duration;
+    double startSel = 0, endSel = dur, pos = 0;
+    mp4trim::RangeInfo ri;
+    mp4trim::Result dr = mp4trim::cutRange(it.full.c_str(), "", startSel, endSel, &ri, true);
+    auto recalc = [&]() { dr = mp4trim::cutRange(it.full.c_str(), "", startSel, endSel, &ri, true); };
+
+#ifdef NXSHOT_FFMPEG
+    VDec d;
+    bool haveDec = d.open(it.full.c_str(), 3);
+    SDL_Texture *tex = nullptr;
+    int ow = 2, oh = 2;
+    std::vector<unsigned char> buf;
+    if (haveDec) {
+        fitSize(d.ctx->width, d.ctx->height, 860, 400, ow, oh);
+        ow &= ~1;
+        oh &= ~1;
+        if (ow < 2) ow = 2;
+        if (oh < 2) oh = 2;
+        tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, ow, oh);
+    }
+    bool needFrame = haveDec && tex;
+    Uint32 lastSeek = 0;
+#endif
+    std::string toast;
+    Uint32 toastUntil = 0;
+    bool sentOk = false;
+    while (!g_quit && appletMainLoop()) {
+        beginFrame();
+        drawHeader("動画を切り取る");
+        // 映像
+        fillRRect(36, 92, 1208, 410, 12, SDL_Color{10, 11, 17, 235});
+#ifdef NXSHOT_FFMPEG
+        if (needFrame && SDL_GetTicks() - lastSeek > 120) {
+            lastSeek = SDL_GetTicks();
+            needFrame = false;
+            if (d.seekTo(pos) && d.toRGBA(ow, oh, buf)) SDL_UpdateTexture(tex, nullptr, buf.data(), ow * 4);
+        }
+        if (tex) {
+            SDL_Rect dst = {36 + (1208 - ow) / 2, 92 + (410 - oh) / 2, ow, oh};
+            SDL_RenderCopy(g_ren, tex, nullptr, &dst);
+        } else
+#endif
+        {
+            drawTextMid(640, 297, "(この版では映像を表示できません。時間だけで切り取れます)", fSmall, C_DIM, 2);
+        }
+        // 時間の表示
+        drawText(48, 512, "いま " + fmtTime(pos) + " / " + fmtTime(dur), fBody, C_TEXT);
+        // タイムライン
+        const int TX = 56, TW = 1168, TY = 560;
+        fillRRect(TX, TY, TW, 16, 8, SDL_Color{255, 255, 255, 30});
+        int sx = TX + (int)(TW * startSel / dur), ex = TX + (int)(TW * endSel / dur);
+        if (ex - sx < 8) ex = sx + 8;
+        fillRRect(sx, TY, ex - sx, 16, 8, C_ACC);
+        if (P.keyframes.size() <= 300) {
+            for (double k : P.keyframes) fillRect(TX + (int)(TW * k / dur), TY + 18, 2, 6, SDL_Color{255, 255, 255, 60});
+        }
+        int px = TX + (int)(TW * pos / dur);
+        fillRect(px - 1, TY - 10, 3, 36, C_WHITE);
+        fillRRect(sx - 3, TY - 6, 8, 28, 3, C_OK);
+        fillRRect(ex - 5, TY - 6, 8, 28, 3, C_WARN);
+        // 選んだ範囲の情報
+        std::string line;
+        SDL_Color lc = C_TEXT;
+        if (dr == mp4trim::OK) {
+            long long lim = (long long)g_cfg.limitMB * 1048576LL - 65536;
+            char b[200];
+            snprintf(b, sizeof(b), "切り出す範囲 %s 〜 %s (%.1f秒)   約 %.1fMB", fmtTime(ri.start).c_str(), fmtTime(ri.end).c_str(), ri.end - ri.start,
+                     ri.newSize / 1048576.0);
+            line = b;
+            if (ri.newSize > lim) {
+                line += g_cfg.trim ? "   上限を超えるので、送るとき最初が削られます" : "   上限を超えています";
+                lc = C_WARN;
+            }
+        } else {
+            line = "範囲が短すぎます(0.2秒より長く選んでください)";
+            lc = C_WARN;
+        }
+        drawText(48, 600, fitText(fSmall, line, 1180), fSmall, lc);
+        drawText(48, 628, "開始はキーフレームに合わせて、少し早くなることがあります", fSmall, C_DIM);
+        if (SDL_GetTicks() < toastUntil) drawText(1244, 628, toast, fSmall, C_WARN, 1);
+        drawFooter("十字: 動かす  L/R: キーフレーム  Y: 開始  X: 終了  A: 切って送る  B: やめる");
+        endFrame();
+
+        // 操作
+        double stepSec = g_cur[BT_ZR] ? 5.0 : (g_cur[BT_ZL] ? 0.1 : 1.0);
+        double np = pos;
+        if (pressed(BT_RIGHT)) np += stepSec;
+        if (pressed(BT_LEFT)) np -= stepSec;
+        if (pressed(BT_R)) {
+            for (double k : P.keyframes) if (k > pos + 0.05) { np = k; break; }
+        }
+        if (pressed(BT_L)) {
+            for (size_t i = P.keyframes.size(); i-- > 0;) if (P.keyframes[i] < pos - 0.05) { np = P.keyframes[i]; break; }
+        }
+        np = std::min(dur - 0.05, std::max(0.0, np));
+        if (np != pos) {
+            pos = np;
+#ifdef NXSHOT_FFMPEG
+            needFrame = haveDec && tex;
+#endif
+        }
+        if (pressed(BT_Y)) {
+            startSel = pos;
+            if (startSel > endSel - 0.5) endSel = dur;
+            recalc();
+        }
+        if (pressed(BT_X)) {
+            endSel = pos;
+            if (endSel < startSel + 0.5) startSel = 0;
+            recalc();
+        }
+        if (pressed(BT_PLUS)) { startSel = 0; endSel = dur; recalc(); toast = "全体に戻しました"; toastUntil = SDL_GetTicks() + 2000; }
+        if (pressed(BT_B)) break;
+        if (pressed(BT_A)) {
+            if (dr != mp4trim::OK) { toast = "範囲を選び直してください"; toastUntil = SDL_GetTicks() + 2000; continue; }
+            drawStatusScreen("動画を切り取る", "動画を切り出しています...");
+            mp4trim::RangeInfo ci;
+            mp4trim::Result r = mp4trim::cutRange(it.full.c_str(), EDIT_VIDEO_PATH, startSel, endSel, &ci, false);
+            if (r != mp4trim::OK) {
+                remove(EDIT_VIDEO_PATH);
+                showMessage("切り出せませんでした", {"コード " + std::to_string((int)r)}, false);
+                continue;
+            }
+            Item e = it;
+            e.edited = EDIT_VIDEO_PATH;
+            char nb[120];
+            snprintf(nb, sizeof(nb), "(%.1f秒〜%.1f秒を切り出し)", ci.start, ci.end);
+            e.editNote = nb;
+            std::vector<Item> v{e};
+            runSend(v, {0});
+            if (!v[0].edited.empty()) remove(v[0].edited.c_str());
+            remove(EDIT_VIDEO_PATH);
+            if (v[0].sent) { it.sent = true; sentOk = true; break; }
+        }
+        SDL_Delay(8);
+    }
+#ifdef NXSHOT_FFMPEG
+    if (tex) SDL_DestroyTexture(tex);
+    d.close();
+#endif
+    return sentOk;
+}
+
 // 写真を大きく見る
 static void previewPhoto(Item &it) {
     SDL_Surface *s = IMG_Load(it.full.c_str());
@@ -1303,6 +1938,7 @@ static void previewPhoto(Item &it) {
     SDL_Texture *tex = s ? SDL_CreateTextureFromSurface(g_ren, s) : nullptr;
     if (s) SDL_FreeSurface(s);
     if (!tex) { showMessage("写真を開けませんでした", {it.name}, false); return; }
+    bool wantEdit = false;
     while (!g_quit && appletMainLoop()) {
         updateInput();
         clearScreen();
@@ -1312,13 +1948,15 @@ static void previewPhoto(Item &it) {
         SDL_Rect dst = {40 + (1200 - dw) / 2, 100 + (508 - dh) / 2, dw, dh};
         SDL_RenderCopy(g_ren, tex, nullptr, &dst);
         previewInfoBar(it);
-        drawFooter("A: チェックを付ける/外す   B: 戻る");
+        drawFooter("A: チェック  X: 編集する  B: 戻る");
         endFrame();
         if (pressed(BT_B)) break;
         if (pressed(BT_A)) it.sel = !it.sel;
+        if (pressed(BT_X)) { wantEdit = true; break; }
         SDL_Delay(8);
     }
     SDL_DestroyTexture(tex);
+    if (wantEdit) screenPhotoEdit(it);
 }
 
 // 動画を再生して見る(音は出ません。最後まで行くとくり返します)
@@ -1345,10 +1983,12 @@ static void previewVideo(Item &it) {
     long frameNo = 0;
     int errors = 0;
     bool haveFrame = false;
+    bool wantTrim = false;
     while (!g_quit && appletMainLoop()) {
         updateInput();
         if (pressed(BT_B)) break;
         if (pressed(BT_A)) it.sel = !it.sel;
+        if (pressed(BT_X)) { wantTrim = true; break; }
 
         int r = d.next();
         if (r == 0) {  // 最後まで来たので、最初に戻る
@@ -1381,11 +2021,12 @@ static void previewVideo(Item &it) {
         SDL_Rect dst = {40 + (1200 - ow) / 2, 100 + (508 - oh) / 2, ow, oh};
         SDL_RenderCopy(g_ren, tex, nullptr, &dst);
         previewInfoBar(it);
-        drawFooter("A: チェックを付ける/外す   B: 戻る   (音は出ません)");
+        drawFooter("A: チェック  X: 切り取る  B: 戻る  (音は出ません)");
         endFrame();
     }
     SDL_DestroyTexture(tex);
     d.close();
+    if (wantTrim) screenVideoTrim(it);
 #else
     (void)it;
     showMessage("動画のプレビューは、この版には入っていません", {"ビルドに switch-ffmpeg が必要です"}, false);
@@ -2281,6 +2922,7 @@ int main(int argc, char **argv) {
     PlFontData fd;
     bool fontOk = ttfOk && plOk && R_SUCCEEDED(plGetSharedFontByType(&fd, PlSharedFontType_Standard));
     applog("init: font=%d", fontOk ? 1 : 0);
+    if (fontOk) { g_fontMem = fd.address; g_fontLen = (int)fd.size; }
 
     if (fontOk) {
         g_win = SDL_CreateWindow("NXShot", 0, 0, 1280, 720, 0);
