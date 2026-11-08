@@ -17,36 +17,48 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ツールを入れる
-        run: apt-get update && apt-get install -y zip
+        run: apt-get update && apt-get install -y zip curl
 
       - name: 常駐版をビルド
         run: make -C sysmodule
 
+      - name: ライブラリのキャッシュを復元する
+        id: portlibs-cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/devkitpro/portlibs/switch
+          key: portlibs-switch-v1
+
       - name: アプリ用のライブラリを入れる
+        if: steps.portlibs-cache.outputs.cache-hit != 'true'
         run: |
-          # pkg.devkitpro.org が一時的に 403 を返すことがあるので、間隔をあけて最大6回リトライ
+          # pkg.devkitpro.org が GitHub からのアクセスに 403 を返すことがある。
+          # 標準のダウンロード方法で失敗したら、curl(ブラウザ風のUser-Agent)でも試す
+          CONF=/opt/devkitpro/pacman/etc/pacman.conf
+          cp "$CONF" /tmp/pacman-curl.conf
+          sed -i '/^\[options\]/a XferCommand = /usr/bin/curl -fL --retry 3 -A "Mozilla/5.0 (X11; Linux x86_64)" -o %o %u' /tmp/pacman-curl.conf
+          PKGS="switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl"
           for i in 1 2 3 4 5 6; do
-            if dkp-pacman -Syu --noconfirm switch-sdl2 switch-sdl2_ttf switch-sdl2_image switch-curl; then
-              exit 0
-            fi
+            if dkp-pacman -Syu --noconfirm $PKGS; then exit 0; fi
+            echo "標準の方法で失敗($i/6)。curlで再試行します"
+            if dkp-pacman --config /tmp/pacman-curl.conf -Syu --noconfirm $PKGS; then exit 0; fi
             echo "失敗($i/6)。$((i*20))秒待って再試行します"
             sleep $((i*20))
           done
           exit 1
 
       - name: 動画プレビュー用の ffmpeg を入れる(入らなくてもビルドは続く)
+        if: steps.portlibs-cache.outputs.cache-hit != 'true'
         run: |
-          # 入らなかった理由が分かるように、メッセージはそのまま表示する。403のときはリトライする
-          dkp-pacman -Ss ffmpeg || true
+          # 入らなくてもビルドは続く。メッセージはそのまま表示する
           ok=0
-          for i in 1 2 3 4 5; do
-            if dkp-pacman -Syu --noconfirm switch-ffmpeg; then ok=1; break; fi
-            echo "ffmpegの取得に失敗($i/5)。$((i*20))秒待って再試行します"
+          for i in 1 2 3; do
+            if dkp-pacman -Syu --noconfirm switch-ffmpeg || dkp-pacman --config /tmp/pacman-curl.conf -Syu --noconfirm switch-ffmpeg; then ok=1; break; fi
+            echo "ffmpegの取得に失敗($i/3)。$((i*20))秒待って再試行します"
             sleep $((i*20))
           done
           if [ "$ok" = 1 ]; then
             echo "switch-ffmpeg: インストール成功"
-            ls /opt/devkitpro/portlibs/switch/lib/pkgconfig | grep -i "libav\|libsw" || true
           else
             echo "::warning::switch-ffmpeg が入りませんでした。動画のプレビューなしでビルドします"
           fi
