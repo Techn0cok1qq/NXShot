@@ -567,7 +567,8 @@ static bool kbdInput(const char *header, const char *guide, const std::string &i
     swkbdConfigSetGuideText(&kbd, guide);
     swkbdConfigSetInitialText(&kbd, init.c_str());
     swkbdConfigSetStringLenMax(&kbd, (u32)maxLen);
-    if (numeric) swkbdConfigSetType(&kbd, SwkbdType_NumPad);
+    // 既定のプリセットは QWERTY だけ(英語配列のみ)。通常のキーボードにすると、本体の言語のキーボード(日本語など)が出る
+    swkbdConfigSetType(&kbd, numeric ? SwkbdType_NumPad : SwkbdType_Normal);
     static char buf[512];
     buf[0] = 0;
     rc = swkbdShow(&kbd, buf, sizeof(buf));
@@ -1661,7 +1662,7 @@ static bool screenPhotoEdit(Item &it) {
                     case TL_MOTION: startRegion(cur); break;
                     case TL_TEXT: {
                         std::string out;
-                        if (textInput("文字を入れる", "写真に入れる文字(日本語は text.txt でも入れられます)", text, 60, out) && !out.empty()) {
+                        if (textInput("文字を入れる", "写真に入れる文字", text, 60, out) && !out.empty()) {
                             text = out;
                             mode = ED_TEXT;
                             tx = base.w / 8;
