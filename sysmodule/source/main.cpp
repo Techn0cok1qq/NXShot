@@ -22,7 +22,7 @@
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
 #define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
-#define VERSION "1.3.0"
+#define VERSION "1.3.1"
 #define TRIM_TMP_PATH "sdmc:/config/nxdiscord/trim_tmp.mp4"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
@@ -131,12 +131,19 @@ void __appExit(void) {
 //     trim=1              上限を超える動画の最初を削って送る(0で無効)
 //     album=sdmc:/...     Albumフォルダの場所(通常は書かない)
 //     auto=1              写真・動画の自動送信(0でオフ。ゲームの開始/終了の通知は続く)
+//     notify=1            ゲームの開始/終了の通知(0でオフ)
+//     footer=1            Discordの通知の下に「NXShot v...」を出す(0でオフ)
+//     hook=名前|URL       送信先を足す(何行でも。1行目も「名前|URL」と書ける)
+//     use=1               いま使う送信先(1行目が1、hook= の行が2, 3, ...)
 struct Config {
-    std::string hook;
+    std::string hook;      // いま使う送信先のURL(hooks と use から決まる)
+    std::string hookName;  // その名前(無ければ空)
     std::string album;
     long limitMB = DEFAULT_LIMIT_MB;
     bool trim = true;
     bool autoSend = true;
+    bool notify = true;
+    bool footer = true;
 };
 
 static std::string trimLine(const char *line) {
@@ -147,16 +154,36 @@ static std::string trimLine(const char *line) {
     return s.substr(i);
 }
 
+// 「名前|URL」か「URL」を、名前とURLに分ける
+static void parseHookEntry(const std::string &s, std::string &name, std::string &url) {
+    size_t p = s.find('|');
+    if (s.compare(0, 8, "https://") == 0 || p == std::string::npos) {
+        name.clear();
+        url = s;
+        return;
+    }
+    name = trimLine(s.substr(0, p).c_str());
+    url = trimLine(s.substr(p + 1).c_str());
+}
+
 static bool loadConfig(Config &c) {
     FILE *f = fopen(CONFIG_PATH, "r");
     if (!f) return false;
     char line[512];
     int n = 0;
     bool ok = false;
-    while (n < 12 && fgets(line, sizeof(line), f)) {
+    std::vector<std::pair<std::string, std::string>> hooks;  // {名前, URL}。1行目が先頭
+    long use = 1;
+    while (n < 60 && fgets(line, sizeof(line), f)) {
         n++;
         std::string t = trimLine(line);
-        if (n == 1) { c.hook = t; ok = true; continue; }
+        if (n == 1) {
+            std::string nm, url;
+            parseHookEntry(t, nm, url);
+            hooks.push_back({nm, url});
+            ok = true;
+            continue;
+        }
         if (t.empty()) continue;
         if (t.compare(0, 6, "limit=") == 0) {
             long v = atol(trimLine(t.c_str() + 6).c_str());
@@ -165,6 +192,16 @@ static bool loadConfig(Config &c) {
             c.trim = atol(trimLine(t.c_str() + 5).c_str()) != 0;
         } else if (t.compare(0, 5, "auto=") == 0) {
             c.autoSend = atol(trimLine(t.c_str() + 5).c_str()) != 0;
+        } else if (t.compare(0, 7, "notify=") == 0) {
+            c.notify = atol(trimLine(t.c_str() + 7).c_str()) != 0;
+        } else if (t.compare(0, 7, "footer=") == 0) {
+            c.footer = atol(trimLine(t.c_str() + 7).c_str()) != 0;
+        } else if (t.compare(0, 5, "hook=") == 0) {
+            std::string nm, url;
+            parseHookEntry(trimLine(t.c_str() + 5), nm, url);
+            if (url.compare(0, 8, "https://") == 0) hooks.push_back({nm, url});
+        } else if (t.compare(0, 4, "use=") == 0) {
+            use = atol(trimLine(t.c_str() + 4).c_str());
         } else if (t.compare(0, 6, "album=") == 0) {
             c.album = trimLine(t.c_str() + 6);
         } else if (c.album.empty() && t.compare(0, 6, "sdmc:/") == 0) {
@@ -175,6 +212,9 @@ static bool loadConfig(Config &c) {
     if (!ok) return false;
     if (c.album.empty()) c.album = DEFAULT_ALBUM;
     while (c.album.size() > 1 && c.album.back() == '/') c.album.pop_back();
+    if (use < 1 || use > (long)hooks.size()) use = 1;
+    c.hookName = hooks[(size_t)(use - 1)].first;
+    c.hook = hooks[(size_t)(use - 1)].second;
     return c.hook.compare(0, 8, "https://") == 0;
 }
 
@@ -346,10 +386,17 @@ static long postShot(const std::string &url, const std::string &payload, const s
 // 送信待ちの通知(ネットワークが無いときのために溜めておく)
 static std::vector<std::string> g_queue;
 
+static bool g_footerOn = true;  // 通知の下に「NXShot v...」を出すか(config.txt の footer=)
+
+// 通知の下に出す小さい文字(ウォーターマーク)。オフなら空
+static std::string footerJson() {
+    return g_footerOn ? std::string(",\"footer\":{\"text\":\"NXShot v" VERSION "\"}") : std::string();
+}
+
 static std::string embedJson(const char *title, const std::string &desc, int color) {
     std::string j = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" + title + "\"";
     if (!desc.empty()) j += ",\"description\":\"" + jsonEscape(desc) + "\"";
-    j += ",\"color\":" + std::to_string(color) + "}]}";
+    j += ",\"color\":" + std::to_string(color) + footerJson() + "}]}";
     return j;
 }
 
@@ -511,6 +558,7 @@ static void checkScreenshots(const Config &cfg) {
     if (!desc.empty()) payload += ",\"description\":\"" + jsonEscape(desc) + "\"";
     payload += ",\"color\":15277667";
     if (!isVideo) payload += ",\"image\":{\"url\":\"attachment://screenshot.jpg\"}";
+    payload += footerJson();
     payload += "}]}";
 
     // 大きいファイルほど時間がかかるので、送信の制限時間を長めにする
@@ -558,7 +606,9 @@ static std::string albumReport(const Config &cfg) {
         return "Albumを読めません。設定→データ管理→スクリーンショットと動画の管理→保存先がSDカードか確認してください。\n場所: " + cfg.album;
     int img = 0, vid = 0;
     for (auto &n : names) { if (mediaKind(n) == MK_VIDEO) vid++; else img++; }
-    return "Albumを読めました。最新の日の写真: " + std::to_string(img) + "枚 / 動画: " + std::to_string(vid) + "本\n送信できるファイルの上限: " + std::to_string(cfg.limitMB) + "MB\n写真・動画の自動送信: " + (cfg.autoSend ? "オン" : "オフ");
+    return "Albumを読めました。最新の日の写真: " + std::to_string(img) + "枚 / 動画: " + std::to_string(vid) + "本\n送信できるファイルの上限: " + std::to_string(cfg.limitMB) + "MB\n写真・動画の自動送信: " + (cfg.autoSend ? "オン" : "オフ") +
+           "\nゲームの開始・終了の通知: " + (cfg.notify ? "オン" : "オフ") +
+           (cfg.hookName.empty() ? std::string() : "\n送信先: " + cfg.hookName);
 }
 
 // ---- メイン ----
@@ -581,11 +631,12 @@ int main(int argc, char **argv) {
             cfgLogged = true;
         }
         if (cfgOk) {
+            g_footerOn = cfg.footer;
             u64 pid = 0;
             if (!getRunningProgramId(pid)) pid = 0;
 
             if (pid != curPid) {
-                if (curPid != 0 && !startPending) {
+                if (curPid != 0 && !startPending && cfg.notify) {
                     enqueue(embedJson("🏁 プレイ終了", g_curTitle + "\nプレイ時間: " + fmtDuration(nowSec() - startSec), 15158332));
                 }
                 nxlog("game: pid=%llX", (unsigned long long)pid);
@@ -602,7 +653,7 @@ int main(int argc, char **argv) {
                         snprintf(b, sizeof(b), "%016llX", (unsigned long long)curPid);
                         g_curTitle = b;
                     }
-                    enqueue(embedJson("🎮 ゲームを開始", g_curTitle, 3447003));
+                    if (cfg.notify) enqueue(embedJson("🎮 ゲームを開始", g_curTitle, 3447003));
                     startPending = false;
                 }
             }
