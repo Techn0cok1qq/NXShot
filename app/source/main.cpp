@@ -35,7 +35,7 @@ extern "C" {
 #include "imgops.h"
 #include "pngsave.h"
 
-#define APP_VERSION_STR "1.3.0"
+#define APP_VERSION_STR "1.3.1"
 #define CONFIG_DIR "sdmc:/config/nxdiscord"
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define SYS_LOG_PATH "sdmc:/config/nxdiscord/log.txt"
@@ -78,10 +78,21 @@ static void applog(const char *fmt, ...) {
 
 // ====================================================================
 // 設定 (config.txt。常駐版と同じ形式)
-//   1行目: Webhook URL / limit=10 / trim=1 / auto=1 / album=sdmc:/...
+//   1行目: Webhook URL(「名前|URL」とも書ける) / limit=10 / trim=1 / auto=1 / album=sdmc:/...
+//   notify=1(ゲームの開始・終了の通知) / footer=1(通知の下に NXShot の版を出す)
+//   hook=名前|URL(送信先を足す。何行でも) / use=1(いま使う送信先。1行目が1)
 // ====================================================================
+struct HookEntry {
+    std::string name;  // 送信先の名前(無くてもよい)
+    std::string url;
+};
+
 struct Config {
-    std::string hook;
+    std::string hook;               // いま使う送信先のURL(hooks[use].url)
+    std::vector<HookEntry> hooks;   // 送信先の一覧(先頭は config.txt の1行目)
+    int use = 0;                    // いま使う送信先(0始まり)
+    bool notify = true;             // ゲームの開始・終了を通知するか(notify=1/0)
+    bool footer = true;             // 通知の下に NXShot の版を出すか(footer=1/0)
     std::string album = DEFAULT_ALBUM;
     long limitMB = DEFAULT_LIMIT_MB;
     bool trim = true;
@@ -98,17 +109,39 @@ static std::string trimLine(const char *line) {
     return s.substr(i);
 }
 
+static void syncHook() {
+    if (g_cfg.hooks.empty()) g_cfg.hooks.push_back(HookEntry());
+    if (g_cfg.use < 0 || g_cfg.use >= (int)g_cfg.hooks.size()) g_cfg.use = 0;
+    g_cfg.hook = g_cfg.hooks[(size_t)g_cfg.use].url;
+}
+
+// 「名前|URL」か「URL」を、名前とURLに分ける
+static HookEntry parseHookEntry(const std::string &s) {
+    HookEntry e;
+    size_t p = s.find('|');
+    if (s.compare(0, 8, "https://") == 0 || p == std::string::npos) {
+        e.url = s;
+    } else {
+        e.name = trimLine(s.substr(0, p).c_str());
+        e.url = trimLine(s.substr(p + 1).c_str());
+    }
+    return e;
+}
+
+static std::string hookLine(const HookEntry &e) { return e.name.empty() ? e.url : e.name + "|" + e.url; }
+
 static void loadConfig() {
     g_cfg = Config();
     FILE *f = fopen(CONFIG_PATH, "r");
-    if (!f) return;
+    if (!f) { syncHook(); return; }
     char line[512];
     int n = 0;
+    long use = 1;
     std::string album;
-    while (n < 12 && fgets(line, sizeof(line), f)) {
+    while (n < 60 && fgets(line, sizeof(line), f)) {
         n++;
         std::string t = trimLine(line);
-        if (n == 1) { g_cfg.hook = t; continue; }
+        if (n == 1) { g_cfg.hooks.push_back(parseHookEntry(t)); continue; }
         if (t.empty()) continue;
         if (t.compare(0, 6, "limit=") == 0) {
             long v = atol(trimLine(t.c_str() + 6).c_str());
@@ -117,6 +150,15 @@ static void loadConfig() {
             g_cfg.trim = atol(trimLine(t.c_str() + 5).c_str()) != 0;
         } else if (t.compare(0, 5, "auto=") == 0) {
             g_cfg.autoSend = atol(trimLine(t.c_str() + 5).c_str()) != 0;
+        } else if (t.compare(0, 7, "notify=") == 0) {
+            g_cfg.notify = atol(trimLine(t.c_str() + 7).c_str()) != 0;
+        } else if (t.compare(0, 7, "footer=") == 0) {
+            g_cfg.footer = atol(trimLine(t.c_str() + 7).c_str()) != 0;
+        } else if (t.compare(0, 5, "hook=") == 0) {
+            HookEntry e = parseHookEntry(trimLine(t.c_str() + 5));
+            if (e.url.compare(0, 8, "https://") == 0) g_cfg.hooks.push_back(e);
+        } else if (t.compare(0, 4, "use=") == 0) {
+            use = atol(trimLine(t.c_str() + 4).c_str());
         } else if (t.compare(0, 9, "updcheck=") == 0) {
             g_cfg.updCheck = atol(trimLine(t.c_str() + 9).c_str()) != 0;
         } else if (t.compare(0, 6, "album=") == 0) {
@@ -128,6 +170,8 @@ static void loadConfig() {
     fclose(f);
     if (!album.empty()) g_cfg.album = album;
     while (g_cfg.album.size() > 1 && g_cfg.album.back() == '/') g_cfg.album.pop_back();
+    g_cfg.use = (int)use - 1;
+    syncHook();
 }
 
 static bool hookOk() { return g_cfg.hook.compare(0, 8, "https://") == 0; }
@@ -135,16 +179,26 @@ static bool hookOk() { return g_cfg.hook.compare(0, 8, "https://") == 0; }
 static bool saveConfig() {
     mkdir("sdmc:/config", 0777);
     mkdir(CONFIG_DIR, 0777);
+    syncHook();
     FILE *f = fopen(CONFIG_PATH, "w");
     if (!f) return false;
-    fprintf(f, "%s\n", g_cfg.hook.c_str());
+    fprintf(f, "%s\n", hookLine(g_cfg.hooks[0]).c_str());
     fprintf(f, "limit=%ld\n", g_cfg.limitMB);
     fprintf(f, "trim=%d\n", g_cfg.trim ? 1 : 0);
     fprintf(f, "auto=%d\n", g_cfg.autoSend ? 1 : 0);
+    fprintf(f, "notify=%d\n", g_cfg.notify ? 1 : 0);
+    fprintf(f, "footer=%d\n", g_cfg.footer ? 1 : 0);
     fprintf(f, "updcheck=%d\n", g_cfg.updCheck ? 1 : 0);
+    for (size_t i = 1; i < g_cfg.hooks.size(); i++) fprintf(f, "hook=%s\n", hookLine(g_cfg.hooks[i]).c_str());
+    fprintf(f, "use=%d\n", g_cfg.use + 1);
     if (g_cfg.album != DEFAULT_ALBUM) fprintf(f, "album=%s\n", g_cfg.album.c_str());
     fclose(f);
     return true;
+}
+
+// 通知の下に出す小さい文字(ウォーターマーク)。オフなら空
+static std::string footerJson() {
+    return g_cfg.footer ? std::string(",\"footer\":{\"text\":\"NXShot v" APP_VERSION_STR "\"}") : std::string();
 }
 
 // Webhook URLを画面に出すときは、末尾の数文字だけ見せる
@@ -1054,6 +1108,9 @@ static std::string fmtMB(long long bytes) {
 // ====================================================================
 enum { SR_OK = 0, SR_SKIP = 1, SR_FAIL = 2, SR_CANCEL = 3 };
 
+// 次に送るものに添える一言(一覧で + を押して入れる。1件送れたら消える)
+static std::string g_comment;
+
 static int sendOne(Item &it, std::string &msg) {
     bool isVideo = it.kind == MK_VIDEO;
     std::string srcPath = it.edited.empty() ? it.full : it.edited;  // 編集したものがあれば、それを送る
@@ -1099,11 +1156,14 @@ static int sendOne(Item &it, std::string &msg) {
 
     std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" +
                           (isVideo ? "🎬 動画" : "📸 スクリーンショット") + "\"";
-    std::string desc = "あとから送信(撮影 " + timeLabel(it.name, true) + ")";
+    std::string desc;
+    if (!g_comment.empty()) desc = g_comment + "\n\n";
+    desc += "あとから送信(撮影 " + timeLabel(it.name, true) + ")";
     if (!it.editNote.empty()) desc += "\n" + it.editNote;
     if (!note.empty()) desc += "\n" + note;
     payload += ",\"description\":\"" + jsonEscape(desc) + "\",\"color\":15277667";
     if (!isVideo) payload += std::string(",\"image\":{\"url\":\"attachment://") + fileName + "\"}";
+    payload += footerJson();
     payload += "}]}";
 
     struct stat sst;
@@ -1149,7 +1209,7 @@ static void runSend(std::vector<Item> &items, const std::vector<int> &idx) {
         int r = sendOne(it, msg);
         std::string line = timeLabel(it.name, false) + "  " + msg;
         g_view.results.push_back({line, r == SR_OK ? 0 : (r == SR_FAIL ? 2 : 1)});
-        if (r == SR_OK) { ok++; it.sent = true; it.sel = false; }
+        if (r == SR_OK) { ok++; it.sent = true; it.sel = false; g_comment.clear(); }
         else if (r == SR_SKIP) skip++;
         else ng++;
         if (r == SR_CANCEL) break;
@@ -2238,10 +2298,24 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
             snprintf(rb, sizeof(rb), "選んだ数: %d   上限: %ldMB", selCount, g_cfg.limitMB);
             drawText(1232, 618, rb, fSmall, C_DIM, 1);
         }
-        drawFooter("十字: 動く  A: チェック  ZR: 大きく見る/動画を再生  Y: 全部  X: 送る  B: 戻る");
+        if (!g_comment.empty()) {
+            std::string one = g_comment;
+            for (auto &ch : one) if (ch == '\n' || ch == '\r') ch = ' ';
+            drawText(48, 640, fitText(fSmall, "コメント: " + one + "  (最初の1件に付きます)", 1180), fSmall, C_OK);
+        }
+        drawFooter("十字: 動く  A: チェック  ZR: 見る/再生  Y: 全部  +: コメント  X: 送る  B: 戻る");
         endFrame();
 
         if (pressed(BT_B)) return;
+        if (pressed(BT_PLUS)) {
+            std::string out;
+            if (kbdInput("コメント", "送るときに添える一言(空にすると消えます)", g_comment, 120, false, out)) {
+                while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) out.pop_back();
+                size_t b = 0;
+                while (b < out.size() && (out[b] == '\n' || out[b] == '\r' || out[b] == ' ')) b++;
+                g_comment = out.substr(b);
+            }
+        }
         if (n > 0) {
             if (pressed(BT_RIGHT)) cur = std::min(n - 1, cur + 1);
             if (pressed(BT_LEFT)) cur = std::max(0, cur - 1);
@@ -2383,6 +2457,149 @@ static void screenYears() {
     }
 }
 
+// 送信先の名前(無いときは番号)
+static std::string hookTitle(const HookEntry &h, int i) {
+    return h.name.empty() ? "送信先 " + std::to_string(i + 1) : h.name;
+}
+
+// 名前から「|」と改行を取って、前後の空白を落とす
+static std::string cleanName(const std::string &s) {
+    std::string o;
+    for (char ch : s)
+        if (ch != '|' && ch != '\r' && ch != '\n') o += ch;
+    return trimLine(o.c_str());
+}
+
+// メニューや状態の画面に出す、いまの送信先(長い名前は縮める)
+static std::string hookStateText() {
+    if (!hookOk()) return "未設定";
+    const std::string &nm = g_cfg.hooks[(size_t)g_cfg.use].name;
+    if (nm.empty()) return "設定済み";
+    std::vector<std::string> g = kanaSplit(nm);
+    if (g.size() <= 8) return nm;
+    g.resize(8);
+    return kanaJoin(g) + "…";
+}
+
+// ====================================================================
+// 画面: 送信先(Webhookを複数入れて、送る先を選ぶ)
+// ====================================================================
+static void screenHooks() {
+    const int MAXHOOKS = 30, ROWS = 8;
+    int cur = g_cfg.use, top = 0, delArm = -1;
+    std::string toast;
+    Uint32 toastUntil = 0;
+    auto changed = [&](const std::string &msg) {
+        bool ok = saveConfig();
+        toast = ok ? msg : "保存できませんでした";
+        toastUntil = SDL_GetTicks() + 2200;
+    };
+    while (!g_quit && appletMainLoop()) {
+        int n = (int)g_cfg.hooks.size();
+        int total = n + 1;  // いちばん下に「送信先を足す」
+        if (cur >= total) cur = total - 1;
+        if (cur < top) top = cur;
+        if (cur >= top + ROWS) top = cur - ROWS + 1;
+
+        beginFrame();
+        drawHeader("送信先");
+        for (int r = 0; r < ROWS && top + r < total; r++) {
+            int i = top + r;
+            int y = 92 + r * 58;
+            bool sel = i == cur;
+            if (sel) {
+                fillRRect(36, y, 1208, 50, 10, C_ACC);
+                strokeRRect(36, y, 1208, 50, 10, 2, C_ACC2);
+            } else {
+                fillRRect(36, y, 1208, 50, 10, SDL_Color{34, 37, 54, 200});
+            }
+            if (i < n) {
+                bool inUse = i == g_cfg.use;
+                std::string label = hookTitle(g_cfg.hooks[(size_t)i], i);
+                drawTextMid(64, y + 25, fitText(fBody, label, 520), fBody, sel ? C_WHITE : C_TEXT);
+                if (inUse) drawTextMid(600, y + 25, "● 使用中", fSmall, sel ? C_WHITE : C_OK);
+                const std::string &u = g_cfg.hooks[(size_t)i].url;
+                bool bad = u.compare(0, 8, "https://") != 0;
+                drawTextMid(1216, y + 25, fitText(fSmall, bad ? std::string("URL未設定") : maskHook(u), 560), fSmall,
+                            bad ? C_WARN : (sel ? C_WHITE : C_DIM), 1);
+            } else {
+                drawTextMid(64, y + 25, "＋ 送信先を足す", fBody, sel ? C_WHITE : C_TEXT);
+            }
+        }
+        std::string hint;
+        if (cur >= n) hint = "A: 新しい送信先を足す(URL → 名前の順に入れます)";
+        else if (delArm == cur) hint = "もう一度 -(マイナス)を押すと、この送信先を消します。やめるときは他のボタン";
+        else hint = "A: ここに送る  X: 名前を変える  Y: URLを変える  -: 消す";
+        drawText(48, 574, fitText(fSmall, hint, 1180), fSmall, C_TEXT);
+        if (SDL_GetTicks() < toastUntil) drawText(1244, 606, toast, fSmall, C_OK, 1);
+        drawFooter("上下: 選ぶ  A: 決定  X: 名前  Y: URL  -: 消す  B: 戻る");
+        endFrame();
+
+        if (pressed(BT_B)) return;
+        int before = cur;
+        if (pressed(BT_DOWN)) cur = (cur + 1) % total;
+        if (pressed(BT_UP)) cur = (cur + total - 1) % total;
+        if (cur != before) delArm = -1;
+
+        if (pressed(BT_A)) {
+            delArm = -1;
+            std::string out;
+            if (cur < n) {
+                g_cfg.use = cur;
+                changed("「" + hookTitle(g_cfg.hooks[(size_t)cur], cur) + "」に切り替えました");
+            } else if (n >= MAXHOOKS) {
+                showMessage("これ以上は足せません", {std::to_string(MAXHOOKS) + "個までです"}, false);
+            } else if (kbdInput("Webhook URL", "https://discord.com/api/webhooks/...", "", 300, false, out)) {
+                if (out.compare(0, 8, "https://") != 0) {
+                    showMessage("URLが正しくありません", {"https:// で始まるURLを入れてください"}, false);
+                } else {
+                    HookEntry e;
+                    e.url = out;
+                    std::string nm;
+                    if (kanaInput("送信先の名前", "", 20, nm)) e.name = cleanName(nm);
+                    g_cfg.hooks.push_back(e);
+                    g_cfg.use = (int)g_cfg.hooks.size() - 1;
+                    cur = g_cfg.use;
+                    changed("足して、そこに切り替えました");
+                }
+            }
+        } else if (pressed(BT_X) && cur < n) {
+            delArm = -1;
+            std::string nm;
+            if (kanaInput("送信先の名前", g_cfg.hooks[(size_t)cur].name, 20, nm)) {
+                g_cfg.hooks[(size_t)cur].name = cleanName(nm);
+                changed("名前を変えました");
+            }
+        } else if (pressed(BT_Y) && cur < n) {
+            delArm = -1;
+            std::string out;
+            if (kbdInput("Webhook URL", "https://discord.com/api/webhooks/...", g_cfg.hooks[(size_t)cur].url, 300, false, out)) {
+                if (out.compare(0, 8, "https://") == 0) {
+                    g_cfg.hooks[(size_t)cur].url = out;
+                    changed("URLを変えました");
+                } else {
+                    showMessage("URLが正しくありません", {"https:// で始まるURLを入れてください"}, false);
+                }
+            }
+        } else if (pressed(BT_MINUS) && cur < n) {
+            if (n <= 1) {
+                showMessage("消せません", {"送信先が1つだけのときは、消せません"}, false);
+            } else if (delArm == cur) {
+                g_cfg.hooks.erase(g_cfg.hooks.begin() + cur);
+                if (g_cfg.use > cur) g_cfg.use--;
+                if (g_cfg.use >= (int)g_cfg.hooks.size()) g_cfg.use = (int)g_cfg.hooks.size() - 1;
+                delArm = -1;
+                changed("消しました");
+            } else {
+                delArm = cur;
+            }
+        } else if (pressed(BT_X) || pressed(BT_Y) || pressed(BT_L) || pressed(BT_R)) {
+            delArm = -1;
+        }
+        SDL_Delay(16);
+    }
+}
+
 // ====================================================================
 // 画面: 設定
 // ====================================================================
@@ -2395,93 +2612,117 @@ static void screenSettings() {
         toast = ok ? "保存しました" : "保存できませんでした";
         toastUntil = SDL_GetTicks() + 1800;
     };
-    const int N = 7;
+    enum { R_HOOKS, R_URL, R_AUTO, R_NOTIFY, R_LIMIT, R_TRIM, R_ALBUM, R_UPD, R_FOOTER, R_BACK, N };
     while (!g_quit && appletMainLoop()) {
         beginFrame();
         drawHeader("設定");
-        const char *names[N] = {"Webhook URL", "写真・動画の自動送信", "送れるファイルの上限", "大きい動画を削って送る",
-                                "Albumの場所", "起動時にアップデートを確認", "戻る"};
+        const char *names[N] = {"送信先(Webhookを選ぶ)", "Webhook URL(いまの送信先)", "写真・動画の自動送信",
+                                "ゲームの開始・終了の通知", "送れるファイルの上限", "大きい動画を削って送る",
+                                "Albumの場所", "起動時にアップデートを確認", "通知の下に「NXShot」を出す", "戻る"};
         std::string vals[N];
-        vals[0] = maskHook(g_cfg.hook);
-        vals[1] = g_cfg.autoSend ? "オン" : "オフ";
-        vals[2] = std::to_string(g_cfg.limitMB) + " MB";
-        vals[3] = g_cfg.trim ? "する" : "しない";
-        vals[4] = g_cfg.album == DEFAULT_ALBUM ? "標準(SDカードのAlbum)" : g_cfg.album;
-        vals[5] = g_cfg.updCheck ? "する" : "しない";
-        vals[6] = "";
+        {
+            const HookEntry &h = g_cfg.hooks[(size_t)g_cfg.use];
+            vals[R_HOOKS] = h.name.empty() ? "送信先 " + std::to_string(g_cfg.use + 1) + "  (全部で " + std::to_string(g_cfg.hooks.size()) + "つ)"
+                                           : h.name + "  (全部で " + std::to_string(g_cfg.hooks.size()) + "つ)";
+        }
+        vals[R_URL] = maskHook(g_cfg.hook);
+        vals[R_AUTO] = g_cfg.autoSend ? "オン" : "オフ";
+        vals[R_NOTIFY] = g_cfg.notify ? "オン" : "オフ";
+        vals[R_LIMIT] = std::to_string(g_cfg.limitMB) + " MB";
+        vals[R_TRIM] = g_cfg.trim ? "する" : "しない";
+        vals[R_ALBUM] = g_cfg.album == DEFAULT_ALBUM ? "標準(SDカードのAlbum)" : g_cfg.album;
+        vals[R_UPD] = g_cfg.updCheck ? "する" : "しない";
+        vals[R_FOOTER] = g_cfg.footer ? "出す" : "出さない";
+        vals[R_BACK] = "";
         for (int i = 0; i < N; i++) {
-            int y = 92 + i * 58;
+            int y = 86 + i * 46;
             bool sel = i == cur;
             if (sel) {
-                fillRRect(36, y, 1208, 50, 10, C_ACC);
-                strokeRRect(36, y, 1208, 50, 10, 2, C_ACC2);
+                fillRRect(36, y, 1208, 40, 10, C_ACC);
+                strokeRRect(36, y, 1208, 40, 10, 2, C_ACC2);
             } else {
-                fillRRect(36, y, 1208, 50, 10, SDL_Color{34, 37, 54, 200});
+                fillRRect(36, y, 1208, 40, 10, SDL_Color{34, 37, 54, 200});
             }
-            drawTextMid(64, y + 25, names[i], fBody, sel ? C_WHITE : C_TEXT);
+            drawTextMid(64, y + 20, names[i], fBody, sel ? C_WHITE : C_TEXT);
             SDL_Color vc = sel ? C_WHITE : C_DIM;
-            if (i == 0 && !hookOk()) vc = C_WARN;
-            if (i == 1) vc = g_cfg.autoSend ? C_OK : C_WARN;
-            if (!vals[i].empty()) drawTextMid(1216, y + 25, fitText(fBody, vals[i], 700), fBody, vc, 1);
+            if (i == R_URL && !hookOk()) vc = C_WARN;
+            if (i == R_AUTO) vc = g_cfg.autoSend ? C_OK : C_WARN;
+            if (i == R_NOTIFY) vc = g_cfg.notify ? C_OK : C_WARN;
+            if (!vals[i].empty()) drawTextMid(1216, y + 20, fitText(fBody, vals[i], 640), fBody, vc, 1);
         }
         std::string hint;
-        if (cur == 0) hint = "A: 入力(長いURLは、PCで config.txt を書き換えるほうが楽です)";
-        else if (cur == 1) hint = "A: オン/オフ を切り替え(オフの間は、撮ったものを自動では送りません。ゲームの開始・終了の通知は続きます)";
-        else if (cur == 2) hint = "左右: 1MBずつ  L/R: 10MBずつ  A: 数字で入力  (ブーストなしのサーバーは約10MB)";
-        else if (cur == 3) hint = "A: する/しない を切り替え(しない: 大きい動画は送りません)";
-        else if (cur == 4) hint = "A: 入力(空にすると標準に戻る)。emuMMCのときだけ変えます";
-        else if (cur == 5) hint = "A: する/しない を切り替え(する: アプリを開いたとき、新しい版がないかGitHubで確かめます)";
+        if (cur == R_HOOKS) hint = "A: 送信先の一覧を開く(切り替え・足す・名前を変える・消す)";
+        else if (cur == R_URL) hint = "A: 入力(いま選んでいる送信先のURL。長いURLは、PCで config.txt を書き換えるほうが楽です)";
+        else if (cur == R_AUTO) hint = "A: オン/オフ を切り替え(オフの間は、撮ったものを自動では送りません)";
+        else if (cur == R_NOTIFY) hint = "A: オン/オフ を切り替え(ゲームを始めた・終えたときのお知らせ。オフでも写真・動画の送信は続きます)";
+        else if (cur == R_LIMIT) hint = "左右: 1MBずつ  L/R: 10MBずつ  A: 数字で入力  (ブーストなしのサーバーは約10MB)";
+        else if (cur == R_TRIM) hint = "A: する/しない を切り替え(しない: 大きい動画は送りません)";
+        else if (cur == R_ALBUM) hint = "A: 入力(空にすると標準に戻る)。emuMMCのときだけ変えます";
+        else if (cur == R_UPD) hint = "A: する/しない を切り替え(する: アプリを開いたとき、新しい版がないかGitHubで確かめます)";
+        else if (cur == R_FOOTER) hint = "A: 出す/出さない を切り替え(Discordの通知の一番下に、小さく「NXShot v" APP_VERSION_STR "」と出ます)";
         else hint = "A または B: 戻る";
-        drawText(48, 508, fitText(fSmall, hint, 1180), fSmall, C_TEXT);
-        drawText(48, 540, "変えた内容は、すぐ保存されます。常駐版は5秒ごとに読み直します", fSmall, C_DIM);
-        if (SDL_GetTicks() < toastUntil) drawText(1244, 540, toast, fSmall, C_OK, 1);
+        drawText(48, 556, fitText(fSmall, hint, 1180), fSmall, C_TEXT);
+        drawText(48, 588, "変えた内容は、すぐ保存されます。常駐版は5秒ごとに読み直します", fSmall, C_DIM);
+        if (SDL_GetTicks() < toastUntil) drawText(1244, 588, toast, fSmall, C_OK, 1);
         drawFooter("上下: 選ぶ  A: 変える  B: 戻る");
         endFrame();
 
         if (pressed(BT_B)) return;
         if (pressed(BT_DOWN)) cur = (cur + 1) % N;
         if (pressed(BT_UP)) cur = (cur + N - 1) % N;
-        if (cur == 2) {
+        if (cur == R_LIMIT) {
             if (pressed(BT_RIGHT) && g_cfg.limitMB < 500) { g_cfg.limitMB++; changed(); }
             if (pressed(BT_LEFT) && g_cfg.limitMB > 1) { g_cfg.limitMB--; changed(); }
             if (pressed(BT_R)) { g_cfg.limitMB = std::min(500L, g_cfg.limitMB + 10); changed(); }
             if (pressed(BT_L)) { g_cfg.limitMB = std::max(1L, g_cfg.limitMB - 10); changed(); }
         }
-        if (cur == 1 && (pressed(BT_RIGHT) || pressed(BT_LEFT))) { g_cfg.autoSend = !g_cfg.autoSend; changed(); }
+        if (pressed(BT_RIGHT) || pressed(BT_LEFT)) {
+            if (cur == R_AUTO) { g_cfg.autoSend = !g_cfg.autoSend; changed(); }
+            else if (cur == R_NOTIFY) { g_cfg.notify = !g_cfg.notify; changed(); }
+            else if (cur == R_UPD) { g_cfg.updCheck = !g_cfg.updCheck; changed(); }
+            else if (cur == R_FOOTER) { g_cfg.footer = !g_cfg.footer; changed(); }
+        }
         if (pressed(BT_A)) {
             std::string out;
-            if (cur == 0) {
+            if (cur == R_HOOKS) {
+                screenHooks();
+            } else if (cur == R_URL) {
                 if (kbdInput("Webhook URL", "https://discord.com/api/webhooks/...", g_cfg.hook, 300, false, out)) {
-                    if (out.compare(0, 8, "https://") == 0) { g_cfg.hook = out; changed(); }
+                    if (out.compare(0, 8, "https://") == 0) { g_cfg.hooks[(size_t)g_cfg.use].url = out; changed(); }
                     else showMessage("URLが正しくありません", {"https:// で始まるURLを入れてください"}, false);
                 }
-            } else if (cur == 1) {
+            } else if (cur == R_AUTO) {
                 g_cfg.autoSend = !g_cfg.autoSend;
                 changed();
-            } else if (cur == 2) {
+            } else if (cur == R_NOTIFY) {
+                g_cfg.notify = !g_cfg.notify;
+                changed();
+            } else if (cur == R_LIMIT) {
                 if (kbdInput("上限(MB)", "1〜500", std::to_string(g_cfg.limitMB), 3, true, out)) {
                     long v = atol(out.c_str());
                     if (v >= 1 && v <= 500) { g_cfg.limitMB = v; changed(); }
                     else showMessage("数が正しくありません", {"1から500までの数を入れてください"}, false);
                 }
-            } else if (cur == 3) {
+            } else if (cur == R_TRIM) {
                 g_cfg.trim = !g_cfg.trim;
                 changed();
-            } else if (cur == 4) {
+            } else if (cur == R_ALBUM) {
                 std::string init = g_cfg.album == DEFAULT_ALBUM ? "" : g_cfg.album;
                 if (kbdInput("Albumの場所", "sdmc:/Nintendo/Album", init, 200, false, out)) {
                     while (out.size() > 1 && out.back() == '/') out.pop_back();
                     g_cfg.album = out.empty() ? std::string(DEFAULT_ALBUM) : out;
                     changed();
                 }
-            } else if (cur == 5) {
+            } else if (cur == R_UPD) {
                 g_cfg.updCheck = !g_cfg.updCheck;
+                changed();
+            } else if (cur == R_FOOTER) {
+                g_cfg.footer = !g_cfg.footer;
                 changed();
             } else {
                 return;
             }
         }
-        if (cur == 5 && (pressed(BT_RIGHT) || pressed(BT_LEFT))) { g_cfg.updCheck = !g_cfg.updCheck; changed(); }
         SDL_Delay(16);
     }
 }
@@ -2520,7 +2761,7 @@ static void screenStatus() {
             {"常駐版", running, running == "動いています" ? C_OK : C_WARN},
             {"常駐版の版", ver, C_TEXT},
             {"Wi-Fi", up ? "つながっています" : "つながっていません", up ? C_OK : C_WARN},
-            {"Webhook", hookOk() ? "設定済み" : "未設定", hookOk() ? C_OK : C_WARN},
+            {"送信先", hookStateText(), hookOk() ? C_OK : C_WARN},
         };
         for (int i = 0; i < 4; i++) {
             int x = 36 + i * 306;
@@ -2562,9 +2803,9 @@ static void doTestSend() {
     drawText(80, 200, "送っています...", fBody, C_TEXT);
     endFrame();
     std::string json = std::string("{\"username\":\"") + HOOK_NAME +
-                       "\",\"embeds\":[{\"title\":\"🟢 NXShotアプリからのテスト\",\"description\":\"このメッセージが届けば、Webhookは正しく動いています。\",\"color\":5763719}]}";
+                       "\",\"embeds\":[{\"title\":\"🟢 NXShotアプリからのテスト\",\"description\":\"このメッセージが届けば、Webhookは正しく動いています。\",\"color\":5763719" + footerJson() + "}]}";
     long code = postJson(g_cfg.hook, json);
-    if (code >= 200 && code < 300) showMessage("送れました", {"Discordのチャンネルを見てください(http " + std::to_string(code) + ")"}, true);
+    if (code >= 200 && code < 300) showMessage("送れました", {"送り先: " + hookTitle(g_cfg.hooks[(size_t)g_cfg.use], g_cfg.use), "Discordのチャンネルを見てください(http " + std::to_string(code) + ")"}, true);
     else showMessage("送れませんでした", {httpHint(code)}, false);
 }
 
@@ -2985,7 +3226,7 @@ static void screenMenu() {
         bool up = networkUp();
         struct Row { const char *label; std::string value; SDL_Color c; };
         Row rows[7] = {
-            {"Webhook", hookOk() ? "設定済み" : "未設定", hookOk() ? C_OK : C_WARN},
+            {"送信先", hookStateText(), hookOk() ? C_OK : C_WARN},
             {"Wi-Fi", up ? "つながっています" : "つながっていません", up ? C_OK : C_WARN},
             {"自動送信", g_cfg.autoSend ? "オン" : "オフ", g_cfg.autoSend ? C_OK : C_WARN},
             {"上限", std::to_string(g_cfg.limitMB) + " MB", C_TEXT},
