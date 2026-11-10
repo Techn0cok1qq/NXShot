@@ -75,26 +75,6 @@ jobs:
           path: /opt/devkitpro/portlibs
           key: portlibs-sdl2-image-ttf-curl-ffmpeg-v1
 
-      - name: ffmpegのエンコーダを確認する(確認用)
-        run: |
-          LIB=/opt/devkitpro/portlibs/switch/lib/libavcodec.a
-          NM=/opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm
-          ls -l "$LIB" || true
-          echo "--- 入っているエンコーダ ---"
-          $NM "$LIB" 2>/dev/null | grep -E " T ff_.*_encoder$" | sed 's/.* T //' | sort -u || true
-          echo "--- H.264系 ---"
-          $NM "$LIB" 2>/dev/null | grep -i -E "x264|h264.*encoder|nvenc" | head -20 || true
-
-      - name: ffmpegのエンコーダを確認する(確認用)
-        run: |
-          LIB=/opt/devkitpro/portlibs/switch/lib/libavcodec.a
-          NM=/opt/devkitpro/devkitA64/bin/aarch64-none-elf-nm
-          ls -l "$LIB" || true
-          echo "--- 入っているエンコーダ ---"
-          $NM "$LIB" 2>/dev/null | grep -E " T ff_.*_encoder$" | sed 's/.* T //' | sort -u || true
-          echo "--- H.264系 ---"
-          $NM "$LIB" 2>/dev/null | grep -i -E "x264|h264.*encoder|nvenc" | head -20 || true
-
       - name: アプリ(nro)をビルド
         run: |
           echo "--- pkg-config の結果 ---"
