@@ -35,7 +35,7 @@ extern "C" {
 #include "imgops.h"
 #include "pngsave.h"
 
-#define APP_VERSION_STR "1.3.1"
+#define APP_VERSION_STR "1.3.2"
 #define CONFIG_DIR "sdmc:/config/nxdiscord"
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define SYS_LOG_PATH "sdmc:/config/nxdiscord/log.txt"
@@ -80,6 +80,7 @@ static void applog(const char *fmt, ...) {
 // 設定 (config.txt。常駐版と同じ形式)
 //   1行目: Webhook URL(「名前|URL」とも書ける) / limit=10 / trim=1 / auto=1 / album=sdmc:/...
 //   notify=1(ゲームの開始・終了の通知) / footer=1(通知の下に NXShot の版を出す)
+//   icon=1(通知にゲームのアイコン。0 なし 1 左上 2 右上 3 フッターの横)
 //   hook=名前|URL(送信先を足す。何行でも) / use=1(いま使う送信先。1行目が1)
 // ====================================================================
 struct HookEntry {
@@ -93,6 +94,7 @@ struct Config {
     int use = 0;                    // いま使う送信先(0始まり)
     bool notify = true;             // ゲームの開始・終了を通知するか(notify=1/0)
     bool footer = true;             // 通知の下に NXShot の版を出すか(footer=1/0)
+    int icon = 1;                   // 通知に付けるゲームのアイコン: 0 なし / 1 左上 / 2 右上 / 3 フッターの横(icon=0〜3)
     std::string album = DEFAULT_ALBUM;
     long limitMB = DEFAULT_LIMIT_MB;
     bool trim = true;
@@ -154,6 +156,9 @@ static void loadConfig() {
             g_cfg.notify = atol(trimLine(t.c_str() + 7).c_str()) != 0;
         } else if (t.compare(0, 7, "footer=") == 0) {
             g_cfg.footer = atol(trimLine(t.c_str() + 7).c_str()) != 0;
+        } else if (t.compare(0, 5, "icon=") == 0) {
+            long v = atol(trimLine(t.c_str() + 5).c_str());
+            g_cfg.icon = (v >= 0 && v <= 3) ? (int)v : 1;
         } else if (t.compare(0, 5, "hook=") == 0) {
             HookEntry e = parseHookEntry(trimLine(t.c_str() + 5));
             if (e.url.compare(0, 8, "https://") == 0) g_cfg.hooks.push_back(e);
@@ -188,6 +193,7 @@ static bool saveConfig() {
     fprintf(f, "auto=%d\n", g_cfg.autoSend ? 1 : 0);
     fprintf(f, "notify=%d\n", g_cfg.notify ? 1 : 0);
     fprintf(f, "footer=%d\n", g_cfg.footer ? 1 : 0);
+    fprintf(f, "icon=%d\n", g_cfg.icon);
     fprintf(f, "updcheck=%d\n", g_cfg.updCheck ? 1 : 0);
     for (size_t i = 1; i < g_cfg.hooks.size(); i++) fprintf(f, "hook=%s\n", hookLine(g_cfg.hooks[i]).c_str());
     fprintf(f, "use=%d\n", g_cfg.use + 1);
@@ -1995,6 +2001,88 @@ static std::string fmtTime(double sec) {
     return b;
 }
 
+// 切り出した動画を再生して確認する。A: これを送る(true)  B: 選び直す(false)
+static bool confirmCutVideo(const char *path, const mp4trim::RangeInfo &ci) {
+#ifdef NXSHOT_FFMPEG
+    VDec d;
+    if (!d.open(path, 3)) {
+        d.close();
+        showMessage("切り出した動画を、再生して確認できませんでした", {"そのまま送ります"}, false);
+        return true;
+    }
+    int ow, oh;
+    fitSize(d.ctx->width, d.ctx->height, 1200, 490, ow, oh);
+    ow &= ~1;
+    oh &= ~1;
+    if (ow < 2) ow = 2;
+    if (oh < 2) oh = 2;
+    SDL_Texture *tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, ow, oh);
+    if (!tex) {
+        d.close();
+        showMessage("切り出した動画を、表示できませんでした", {"そのまま送ります"}, false);
+        return true;
+    }
+    // 画面の下に出す情報(長さ・大きさ・上限)
+    struct stat st;
+    long long sz = stat(path, &st) == 0 ? (long long)st.st_size : (long long)ci.newSize;
+    char ib[200];
+    snprintf(ib, sizeof(ib), "切り出した動画  %.1f秒   %s", ci.end - ci.start, fmtMB(sz).c_str());
+    std::string info = ib;
+    SDL_Color ic = C_TEXT;
+    long long lim = (long long)g_cfg.limitMB * 1048576LL - 65536;
+    if (sz > lim) {
+        info += g_cfg.trim ? "   上限を超えるので、送るとき最初が削られます" : "   上限を超えるので送れません";
+        ic = C_WARN;
+    }
+    std::vector<unsigned char> buf;
+    bool first = true, haveFrame = false, ok = false;
+    Uint32 t0 = 0;
+    double base = 0;
+    long frameNo = 0;
+    int errors = 0;
+    while (!g_quit && appletMainLoop()) {
+        updateInput();
+        if (pressed(BT_B)) { ok = false; break; }
+        if (pressed(BT_A)) { ok = true; break; }
+
+        int r = d.next();
+        if (r == 0) { d.rewind(); first = true; continue; }  // 最後まで来たら、最初に戻ってくり返す
+        if (r < 0) {
+            if (++errors > 5) { ok = true; break; }
+            d.rewind();
+            first = true;
+            continue;
+        }
+        double pts = d.ptsSec();
+        if (pts < 0) pts = frameNo / 30.0;
+        frameNo++;
+        if (first) { first = false; t0 = SDL_GetTicks(); base = pts; frameNo = 0; }
+        double now = (SDL_GetTicks() - t0) / 1000.0;
+        double due = pts - base;
+        if (haveFrame && due < now - 0.08) continue;
+        if (due > now) SDL_Delay((Uint32)(std::min(0.1, due - now) * 1000));
+        if (!d.toRGBA(ow, oh, buf)) { ok = true; break; }
+        SDL_UpdateTexture(tex, nullptr, buf.data(), ow * 4);
+        haveFrame = true;
+        clearScreen();
+        drawHeader("切り取った動画の確認");
+        SDL_Rect dst = {40 + (1200 - ow) / 2, 100 + (490 - oh) / 2, ow, oh};
+        SDL_RenderCopy(g_ren, tex, nullptr, &dst);
+        drawText(48, 606, fitText(fSmall, info, 1180), fSmall, ic);
+        drawText(48, 634, "この動画が送られます。違っていたら B で、範囲を選び直せます", fSmall, C_DIM);
+        drawFooter("A: これを送る  B: 選び直す  (音は出ません)");
+        endFrame();
+    }
+    SDL_DestroyTexture(tex);
+    d.close();
+    return ok;
+#else
+    (void)path;
+    (void)ci;
+    return true;
+#endif
+}
+
 static bool screenVideoTrim(Item &it) {
     mkdir(EDIT_DIR, 0777);
     mp4trim::Probe P;
@@ -2083,7 +2171,7 @@ static bool screenVideoTrim(Item &it) {
         drawText(48, 600, fitText(fSmall, line, 1180), fSmall, lc);
         drawText(48, 628, "開始はキーフレームに合わせて、少し早くなることがあります", fSmall, C_DIM);
         if (SDL_GetTicks() < toastUntil) drawText(1244, 628, toast, fSmall, C_WARN, 1);
-        drawFooter("十字: 動かす  L/R: キーフレーム  Y: 開始  X: 終了  A: 切って送る  B: やめる");
+        drawFooter("十字: 動かす  L/R: キーフレーム  Y: 開始  X: 終了  A: 切って確認  B: やめる");
         endFrame();
 
         // 操作
@@ -2124,6 +2212,10 @@ static bool screenVideoTrim(Item &it) {
             if (r != mp4trim::OK) {
                 remove(EDIT_VIDEO_PATH);
                 showMessage("切り出せませんでした", {"コード " + std::to_string((int)r)}, false);
+                continue;
+            }
+            if (!confirmCutVideo(EDIT_VIDEO_PATH, ci)) {  // 確認して、違っていたら選び直し
+                remove(EDIT_VIDEO_PATH);
                 continue;
             }
             Item e = it;
@@ -2263,13 +2355,27 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
     applog("grid: %s %zu件", title.c_str(), items.size());
     const int PAGE = GRID_COLS * GRID_ROWS;
     int cur = 0, topRow = 0;
+    int filter = 0;  // 0: すべて  1: 写真だけ  2: 動画だけ(ZLで切り替え)
     while (!g_quit && appletMainLoop()) {
         beginFrame();
-        int n = (int)items.size();
+        // 絞り込みで見えているものの番号(items の中での位置)
+        std::vector<int> view;
+        int nImg = 0, nVid = 0;
+        for (size_t i = 0; i < items.size(); i++) {
+            if (items[i].kind == MK_IMAGE) nImg++;
+            else if (items[i].kind == MK_VIDEO) nVid++;
+            if (filter == 0 || (filter == 1 && items[i].kind == MK_IMAGE) || (filter == 2 && items[i].kind == MK_VIDEO))
+                view.push_back((int)i);
+        }
+        int n = (int)view.size();
+        if (cur >= n) cur = n > 0 ? n - 1 : 0;
         int selCount = 0;
-        for (auto &it : items) if (it.sel) selCount++;
-        drawHeader(title + "   " + std::to_string(n) + "件");
-        if (n == 0) drawText(80, 200, "写真・動画はありません", fBody, C_DIM);
+        for (int vi : view) if (items[(size_t)vi].sel) selCount++;
+        const char *flabel = filter == 1 ? "  [写真だけ]" : (filter == 2 ? "  [動画だけ]" : "");
+        drawHeader(title + "   " + std::to_string(n) + "件" + flabel);
+        if (n == 0) {
+            drawText(80, 200, filter == 0 ? "写真・動画はありません" : "この絞り込みでは、見つかりません(ZL で切り替え)", fBody, C_DIM);
+        }
 
         int first = topRow * GRID_COLS;
         std::vector<int> missing;
@@ -2278,14 +2384,15 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
             if (i >= n) break;
             int x = GRID_X0 + (k % GRID_COLS) * GRID_PX;
             int y = GRID_Y0 + (k / GRID_COLS) * GRID_PY;
-            drawTile(items[i], x, y, i == cur);
-            if (!g_thumbs.count(items[i].full)) {
-                if (i == cur) missing.insert(missing.begin(), i);  // いま選んでいるものを先に
-                else missing.push_back(i);
+            Item &t = items[(size_t)view[(size_t)i]];
+            drawTile(t, x, y, i == cur);
+            if (!g_thumbs.count(t.full)) {
+                if (i == cur) missing.insert(missing.begin(), view[(size_t)i]);  // いま選んでいるものを先に
+                else missing.push_back(view[(size_t)i]);
             }
         }
         if (n > 0) {
-            Item &c = items[cur];
+            Item &c = items[(size_t)view[(size_t)cur]];
             long long sz = itemSize(c);
             std::string d = timeLabel(c.name, true) + "   " + (c.kind == MK_VIDEO ? "動画" : "写真") + "   " + fmtMB(sz);
             SDL_Color dc = C_TEXT;
@@ -2294,8 +2401,8 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
                 else { d += "   → 上限を超えるので送れません"; dc = C_NG; }
             }
             drawText(48, 618, fitText(fSmall, d, 800), fSmall, dc);
-            char rb[120];
-            snprintf(rb, sizeof(rb), "選んだ数: %d   上限: %ldMB", selCount, g_cfg.limitMB);
+            char rb[160];
+            snprintf(rb, sizeof(rb), "写真 %d  動画 %d   選んだ数: %d   上限: %ldMB", nImg, nVid, selCount, g_cfg.limitMB);
             drawText(1232, 618, rb, fSmall, C_DIM, 1);
         }
         if (!g_comment.empty()) {
@@ -2303,10 +2410,16 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
             for (auto &ch : one) if (ch == '\n' || ch == '\r') ch = ' ';
             drawText(48, 640, fitText(fSmall, "コメント: " + one + "  (最初の1件に付きます)", 1180), fSmall, C_OK);
         }
-        drawFooter("十字: 動く  A: チェック  ZR: 見る/再生  Y: 全部  +: コメント  X: 送る  B: 戻る");
+        drawFooter("十字: 動く  A: チェック  ZR: 見る/再生  ZL: 写真/動画  Y: 全部  +: コメント  X: 送る  B: 戻る");
         endFrame();
 
         if (pressed(BT_B)) return;
+        if (pressed(BT_ZL)) {
+            filter = (filter + 1) % 3;
+            cur = 0;
+            topRow = 0;
+            continue;
+        }
         if (pressed(BT_PLUS)) {
             std::string out;
             if (kbdInput("コメント", "送るときに添える一言(空にすると消えます)", g_comment, 120, false, out)) {
@@ -2326,17 +2439,18 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
             int row = cur / GRID_COLS;
             if (row < topRow) topRow = row;
             if (row >= topRow + GRID_ROWS) topRow = row - GRID_ROWS + 1;
-            if (pressed(BT_A)) items[cur].sel = !items[cur].sel;
-            if (pressed(BT_ZR)) screenPreview(items[cur]);
-            if (pressed(BT_Y)) {
+            Item &cu = items[(size_t)view[(size_t)cur]];
+            if (pressed(BT_A)) cu.sel = !cu.sel;
+            if (pressed(BT_ZR)) screenPreview(cu);
+            if (pressed(BT_Y)) {  // 見えているものだけ、全部チェック/全部外す
                 bool any = false;
-                for (auto &it : items) if (!it.sel) { any = true; break; }
-                for (auto &it : items) it.sel = any;
+                for (int vi : view) if (!items[(size_t)vi].sel) { any = true; break; }
+                for (int vi : view) items[(size_t)vi].sel = any;
             }
             if (pressed(BT_X)) {
                 std::vector<int> idx;
-                for (size_t i = 0; i < items.size(); i++) if (items[i].sel) idx.push_back((int)i);
-                if (idx.empty()) idx.push_back(cur);  // 何も選んでいなければ、いま選んでいる1件
+                for (int vi : view) if (items[(size_t)vi].sel) idx.push_back(vi);  // 見えているもののうち、チェックしたもの
+                if (idx.empty()) idx.push_back(view[(size_t)cur]);  // 何も選んでいなければ、いま選んでいる1件
                 if (!hookOk()) {
                     showMessage("Webhook URLが未設定です", {"設定画面で、Webhook URLを入れてください"}, false);
                 } else if (!networkUp()) {
@@ -2350,10 +2464,14 @@ static void screenGrid(const std::string &title, const std::vector<std::string> 
         // 見えているもののサムネを、少しずつ作る(1回の描画で長く止まらないよう、30msまで)
         Uint32 t0 = SDL_GetTicks();
         for (int i : missing) {
-            thumbLoad(items[i]);
+            thumbLoad(items[(size_t)i]);
             if (SDL_GetTicks() - t0 > 30) break;
         }
-        thumbEvict(items, first - PAGE * 2, first + PAGE * 3);
+        if (n > 0) {
+            int lo = view[(size_t)std::max(0, first - PAGE * 2)];
+            int hi = view[(size_t)std::min(n - 1, first + PAGE * 3)] + 1;
+            thumbEvict(items, lo, hi);
+        }
     }
 }
 
@@ -2612,12 +2730,13 @@ static void screenSettings() {
         toast = ok ? "保存しました" : "保存できませんでした";
         toastUntil = SDL_GetTicks() + 1800;
     };
-    enum { R_HOOKS, R_URL, R_AUTO, R_NOTIFY, R_LIMIT, R_TRIM, R_ALBUM, R_UPD, R_FOOTER, R_BACK, N };
+    enum { R_HOOKS, R_URL, R_AUTO, R_NOTIFY, R_ICON, R_LIMIT, R_TRIM, R_ALBUM, R_UPD, R_FOOTER, R_BACK, N };
+    static const char *ICONS[4] = {"出さない", "左上(ゲーム名の横)", "右上(大きめ)", "一番下(フッターの横)"};
     while (!g_quit && appletMainLoop()) {
         beginFrame();
         drawHeader("設定");
         const char *names[N] = {"送信先(Webhookを選ぶ)", "Webhook URL(いまの送信先)", "写真・動画の自動送信",
-                                "ゲームの開始・終了の通知", "送れるファイルの上限", "大きい動画を削って送る",
+                                "ゲームの開始・終了の通知", "通知にゲームのアイコンを付ける", "送れるファイルの上限", "大きい動画を削って送る",
                                 "Albumの場所", "起動時にアップデートを確認", "通知の下に「NXShot」を出す", "戻る"};
         std::string vals[N];
         {
@@ -2628,6 +2747,7 @@ static void screenSettings() {
         vals[R_URL] = maskHook(g_cfg.hook);
         vals[R_AUTO] = g_cfg.autoSend ? "オン" : "オフ";
         vals[R_NOTIFY] = g_cfg.notify ? "オン" : "オフ";
+        vals[R_ICON] = ICONS[g_cfg.icon & 3];
         vals[R_LIMIT] = std::to_string(g_cfg.limitMB) + " MB";
         vals[R_TRIM] = g_cfg.trim ? "する" : "しない";
         vals[R_ALBUM] = g_cfg.album == DEFAULT_ALBUM ? "標準(SDカードのAlbum)" : g_cfg.album;
@@ -2635,26 +2755,27 @@ static void screenSettings() {
         vals[R_FOOTER] = g_cfg.footer ? "出す" : "出さない";
         vals[R_BACK] = "";
         for (int i = 0; i < N; i++) {
-            int y = 86 + i * 46;
+            int y = 86 + i * 42;
             bool sel = i == cur;
             if (sel) {
-                fillRRect(36, y, 1208, 40, 10, C_ACC);
-                strokeRRect(36, y, 1208, 40, 10, 2, C_ACC2);
+                fillRRect(36, y, 1208, 36, 10, C_ACC);
+                strokeRRect(36, y, 1208, 36, 10, 2, C_ACC2);
             } else {
-                fillRRect(36, y, 1208, 40, 10, SDL_Color{34, 37, 54, 200});
+                fillRRect(36, y, 1208, 36, 10, SDL_Color{34, 37, 54, 200});
             }
-            drawTextMid(64, y + 20, names[i], fBody, sel ? C_WHITE : C_TEXT);
+            drawTextMid(64, y + 18, names[i], fBody, sel ? C_WHITE : C_TEXT);
             SDL_Color vc = sel ? C_WHITE : C_DIM;
             if (i == R_URL && !hookOk()) vc = C_WARN;
             if (i == R_AUTO) vc = g_cfg.autoSend ? C_OK : C_WARN;
             if (i == R_NOTIFY) vc = g_cfg.notify ? C_OK : C_WARN;
-            if (!vals[i].empty()) drawTextMid(1216, y + 20, fitText(fBody, vals[i], 640), fBody, vc, 1);
+            if (!vals[i].empty()) drawTextMid(1216, y + 18, fitText(fBody, vals[i], 640), fBody, vc, 1);
         }
         std::string hint;
         if (cur == R_HOOKS) hint = "A: 送信先の一覧を開く(切り替え・足す・名前を変える・消す)";
         else if (cur == R_URL) hint = "A: 入力(いま選んでいる送信先のURL。長いURLは、PCで config.txt を書き換えるほうが楽です)";
         else if (cur == R_AUTO) hint = "A: オン/オフ を切り替え(オフの間は、撮ったものを自動では送りません)";
         else if (cur == R_NOTIFY) hint = "A: オン/オフ を切り替え(ゲームを始めた・終えたときのお知らせ。オフでも写真・動画の送信は続きます)";
+        else if (cur == R_ICON) hint = "A: 切り替え(通知に、遊んでいるゲームのアイコンが付きます。常駐版が送る通知だけです)";
         else if (cur == R_LIMIT) hint = "左右: 1MBずつ  L/R: 10MBずつ  A: 数字で入力  (ブーストなしのサーバーは約10MB)";
         else if (cur == R_TRIM) hint = "A: する/しない を切り替え(しない: 大きい動画は送りません)";
         else if (cur == R_ALBUM) hint = "A: 入力(空にすると標準に戻る)。emuMMCのときだけ変えます";
@@ -2679,6 +2800,7 @@ static void screenSettings() {
         if (pressed(BT_RIGHT) || pressed(BT_LEFT)) {
             if (cur == R_AUTO) { g_cfg.autoSend = !g_cfg.autoSend; changed(); }
             else if (cur == R_NOTIFY) { g_cfg.notify = !g_cfg.notify; changed(); }
+            else if (cur == R_ICON) { g_cfg.icon = (g_cfg.icon + (pressed(BT_RIGHT) ? 1 : 3)) % 4; changed(); }
             else if (cur == R_UPD) { g_cfg.updCheck = !g_cfg.updCheck; changed(); }
             else if (cur == R_FOOTER) { g_cfg.footer = !g_cfg.footer; changed(); }
         }
@@ -2696,6 +2818,9 @@ static void screenSettings() {
                 changed();
             } else if (cur == R_NOTIFY) {
                 g_cfg.notify = !g_cfg.notify;
+                changed();
+            } else if (cur == R_ICON) {
+                g_cfg.icon = (g_cfg.icon + 1) % 4;
                 changed();
             } else if (cur == R_LIMIT) {
                 if (kbdInput("上限(MB)", "1〜500", std::to_string(g_cfg.limitMB), 3, true, out)) {
