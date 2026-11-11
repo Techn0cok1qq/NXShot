@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <memory>
 #include <unistd.h>
 #include <cstdarg>
 #include "mp4trim.h"
@@ -22,7 +23,7 @@
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
 #define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
-#define VERSION "1.3.1"
+#define VERSION "1.3.2"
 #define TRIM_TMP_PATH "sdmc:/config/nxdiscord/trim_tmp.mp4"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
@@ -133,6 +134,7 @@ void __appExit(void) {
 //     auto=1              写真・動画の自動送信(0でオフ。ゲームの開始/終了の通知は続く)
 //     notify=1            ゲームの開始/終了の通知(0でオフ)
 //     footer=1            Discordの通知の下に「NXShot v...」を出す(0でオフ)
+//     icon=1              通知にゲームのアイコンを付ける(0: なし 1: 左上(ゲーム名の横) 2: 右上(大きめ) 3: 一番下(フッターの横))
 //     hook=名前|URL       送信先を足す(何行でも。1行目も「名前|URL」と書ける)
 //     use=1               いま使う送信先(1行目が1、hook= の行が2, 3, ...)
 struct Config {
@@ -144,6 +146,7 @@ struct Config {
     bool autoSend = true;
     bool notify = true;
     bool footer = true;
+    int icon = 1;  // ゲームのアイコン: 0 なし / 1 左上 / 2 右上 / 3 フッター
 };
 
 static std::string trimLine(const char *line) {
@@ -196,6 +199,9 @@ static bool loadConfig(Config &c) {
             c.notify = atol(trimLine(t.c_str() + 7).c_str()) != 0;
         } else if (t.compare(0, 7, "footer=") == 0) {
             c.footer = atol(trimLine(t.c_str() + 7).c_str()) != 0;
+        } else if (t.compare(0, 5, "icon=") == 0) {
+            long v = atol(trimLine(t.c_str() + 5).c_str());
+            c.icon = (v >= 0 && v <= 3) ? (int)v : 1;
         } else if (t.compare(0, 5, "hook=") == 0) {
             std::string nm, url;
             parseHookEntry(trimLine(t.c_str() + 5), nm, url);
@@ -225,7 +231,8 @@ static bool getRunningProgramId(u64 &programId) {
     return R_SUCCEEDED(pminfoGetProgramId(&programId, pid));
 }
 
-static bool getTitleName(u64 programId, std::string &name) {
+// iconOut があれば、ゲームのアイコン(JPEG)も取り出す(同じデータに入っている)
+static bool getTitleName(u64 programId, std::string &name, std::shared_ptr<const std::string> *iconOut = nullptr) {
     static NsApplicationControlData data;  // 静的確保でスタックを節約
     u64 actualSize = 0;
     if (R_FAILED(nsGetApplicationControlData(NsApplicationControlSource_Storage, programId, &data,
@@ -241,6 +248,14 @@ static bool getTitleName(u64 programId, std::string &name) {
     }
     if (!entry) return false;
     name.assign(entry->name);
+    if (iconOut) {
+        iconOut->reset();
+        size_t isz = (size_t)actualSize - sizeof(data.nacp);
+        if (isz > sizeof(data.icon)) isz = sizeof(data.icon);
+        // JPEGの目印(FF D8)があるときだけ使う
+        if (isz > 4 && data.icon[0] == 0xFF && data.icon[1] == 0xD8)
+            *iconOut = std::make_shared<const std::string>(reinterpret_cast<const char *>(data.icon), isz);
+    }
     return !name.empty();
 }
 
@@ -348,8 +363,40 @@ static long postJson(const std::string &url, const std::string &json) {
     return code;
 }
 
+// アイコン(JPEG)を添えて、JSONの通知を送る。icon が空なら、ふつうのJSON送信
+static long postJsonWithIcon(const std::string &url, const std::string &json, const std::shared_ptr<const std::string> &icon) {
+    if (!icon || icon->empty()) return postJson(url, json);
+    if (!g_curlReady) return -1;
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+    setCommon(c, url);
+    struct curl_slist *h = curl_slist_append(nullptr, "Expect:");
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER, h);
+    curl_mime *m = curl_mime_init(c);
+    curl_mimepart *p = curl_mime_addpart(m);
+    curl_mime_name(p, "payload_json");
+    curl_mime_data(p, json.c_str(), json.size());
+    curl_mime_type(p, "application/json");
+    p = curl_mime_addpart(m);
+    curl_mime_name(p, "files[0]");
+    curl_mime_data(p, icon->data(), icon->size());
+    curl_mime_filename(p, "icon.jpg");
+    curl_mime_type(p, "image/jpeg");
+    curl_easy_setopt(c, CURLOPT_MIMEPOST, m);
+    long code = -1;
+    CURLcode rc = curl_easy_perform(c);
+    if (rc == CURLE_OK) curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+    else nxlog("postJsonWithIcon: curl error %d (%s) %s", (int)rc, curl_easy_strerror(rc), g_errbuf);
+    if (rc == CURLE_OK && code >= 300) nxlog("postJsonWithIcon: http %ld", code);
+    curl_mime_free(m);
+    curl_slist_free_all(h);
+    curl_easy_cleanup(c);
+    return code;
+}
+
 static long postShot(const std::string &url, const std::string &payload, const std::string &path,
-                     const char *attachName, const char *mime, long timeoutSec) {
+                     const char *attachName, const char *mime, long timeoutSec,
+                     const std::shared_ptr<const std::string> &icon = nullptr) {
     if (!g_curlReady) return -1;
     nxlog("postShot: easy_init (%s)", path.c_str());
     CURL *c = curl_easy_init();
@@ -369,6 +416,13 @@ static long postShot(const std::string &url, const std::string &payload, const s
     curl_mime_filedata(p, path.c_str());
     curl_mime_filename(p, attachName);
     curl_mime_type(p, mime);
+    if (icon && !icon->empty()) {  // ゲームのアイコン(通知の中で attachment://icon.jpg として使う)
+        p = curl_mime_addpart(m);
+        curl_mime_name(p, "files[1]");
+        curl_mime_data(p, icon->data(), icon->size());
+        curl_mime_filename(p, "icon.jpg");
+        curl_mime_type(p, "image/jpeg");
+    }
     curl_easy_setopt(c, CURLOPT_MIMEPOST, m);
 
     long code = -1;
@@ -384,25 +438,55 @@ static long postShot(const std::string &url, const std::string &payload, const s
 }
 
 // 送信待ちの通知(ネットワークが無いときのために溜めておく)
-static std::vector<std::string> g_queue;
+struct QItem {
+    std::string json;
+    std::shared_ptr<const std::string> icon;  // 通知に添えるゲームのアイコン(無ければ空)
+};
+static std::vector<QItem> g_queue;
 
+static std::string g_curTitle;  // いま遊んでいるゲーム名(スクショの説明に使う)
+static std::shared_ptr<const std::string> g_curIcon;  // いま遊んでいるゲームのアイコン(JPEG)。取れなければ空
 static bool g_footerOn = true;  // 通知の下に「NXShot v...」を出すか(config.txt の footer=)
+static int g_iconMode = 1;      // ゲームのアイコン: 0 なし / 1 左上 / 2 右上 / 3 フッター(config.txt の icon=)
 
-// 通知の下に出す小さい文字(ウォーターマーク)。オフなら空
-static std::string footerJson() {
-    return g_footerOn ? std::string(",\"footer\":{\"text\":\"NXShot v" VERSION "\"}") : std::string();
+static bool iconActive() { return g_curIcon && g_iconMode != 0; }
+
+// 通知の中の「アイコンの指定」と「下の小さい文字」。アイコンの置き場所は icon= で決まる
+//  1: 名前の横(左上)  2: 右上(大きめ)  3: 一番下(フッターの横)
+static std::string footerAndIconJson() {
+    std::string j;
+    if (iconActive() && g_iconMode == 1)
+        j += ",\"author\":{\"name\":\"" + jsonEscape(g_curTitle.empty() ? std::string("NXShot") : g_curTitle) +
+             "\",\"icon_url\":\"attachment://icon.jpg\"}";
+    if (iconActive() && g_iconMode == 2) j += ",\"thumbnail\":{\"url\":\"attachment://icon.jpg\"}";
+    if (iconActive() && g_iconMode == 3) {
+        std::string text = g_footerOn ? std::string("NXShot v" VERSION) : (g_curTitle.empty() ? std::string("NXShot") : g_curTitle);
+        j += ",\"footer\":{\"text\":\"" + jsonEscape(text) + "\",\"icon_url\":\"attachment://icon.jpg\"}";
+    } else if (g_footerOn) {
+        j += ",\"footer\":{\"text\":\"NXShot v" VERSION "\"}";
+    }
+    return j;
+}
+
+// 通知の文の先頭にゲーム名を付ける。名前つきのアイコン(左上)を出すときは、重ならないよう付けない
+static std::string withTitle(const std::string &msg) {
+    if (g_curTitle.empty() || (iconActive() && g_iconMode == 1)) return msg;
+    return msg.empty() ? g_curTitle : g_curTitle + "\n" + msg;
 }
 
 static std::string embedJson(const char *title, const std::string &desc, int color) {
     std::string j = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" + title + "\"";
     if (!desc.empty()) j += ",\"description\":\"" + jsonEscape(desc) + "\"";
-    j += ",\"color\":" + std::to_string(color) + footerJson() + "}]}";
+    j += ",\"color\":" + std::to_string(color) + footerAndIconJson() + "}]}";
     return j;
 }
 
 static void enqueue(const std::string &json) {
     if (g_queue.size() >= 20) g_queue.erase(g_queue.begin());
-    g_queue.push_back(json);
+    QItem q;
+    q.json = json;
+    if (json.find("attachment://icon.jpg") != std::string::npos) q.icon = g_curIcon;  // この時点のゲームのアイコン
+    g_queue.push_back(q);
 }
 
 // 成功(2xx)か、再送しても無駄(4xx。ただし429は除く)なら、その通知は終わりにする
@@ -410,7 +494,7 @@ static bool isFinal(long code) { return (code >= 200 && code < 300) || (code >= 
 
 static void flushQueue(const Config &cfg) {
     for (int i = 0; i < 3 && !g_queue.empty(); i++) {
-        long code = postJson(cfg.hook, g_queue.front());
+        long code = postJsonWithIcon(cfg.hook, g_queue.front().json, g_queue.front().icon);
         if (!isFinal(code)) break;
         g_queue.erase(g_queue.begin());
     }
@@ -476,7 +560,6 @@ static bool scanNewestDay(const std::string &album, std::string &dayPath, std::v
     return true;
 }
 
-static std::string g_curTitle;  // いま遊んでいるゲーム名(スクショの説明に使う)
 
 static void checkScreenshots(const Config &cfg) {
     std::string dayPath;
@@ -543,7 +626,7 @@ static void checkScreenshots(const Config &cfg) {
                 snprintf(msg, sizeof(msg), "ファイルが大きいため送れませんでした(%.1fMB / 上限%ldMB)。config.txtのlimit=で上限を変えられます。",
                          st.st_size / 1048576.0, cfg.limitMB);
             nxlog("media: 上限超え %s (%lld bytes, limit=%ldMB)", next.c_str(), (long long)st.st_size, cfg.limitMB);
-            std::string d = g_curTitle.empty() ? std::string(msg) : g_curTitle + "\n" + msg;
+            std::string d = withTitle(msg);
             enqueue(embedJson(isVideo ? "🎬 動画(未送信)" : "📸 スクリーンショット(未送信)", d, 10070709));
             g_lastSent = next;
             g_pendingName.clear();
@@ -553,12 +636,12 @@ static void checkScreenshots(const Config &cfg) {
 
     std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" +
                           (isVideo ? "🎬 動画" : "📸 スクリーンショット") + "\"";
-    std::string desc = g_curTitle;
+    std::string desc = withTitle("");
     if (!note.empty()) desc += (desc.empty() ? "" : "\n") + note;
     if (!desc.empty()) payload += ",\"description\":\"" + jsonEscape(desc) + "\"";
     payload += ",\"color\":15277667";
     if (!isVideo) payload += ",\"image\":{\"url\":\"attachment://screenshot.jpg\"}";
-    payload += footerJson();
+    payload += footerAndIconJson();
     payload += "}]}";
 
     // 大きいファイルほど時間がかかるので、送信の制限時間を長めにする
@@ -566,7 +649,8 @@ static void checkScreenshots(const Config &cfg) {
     long long sendSize = (stat(sendPath.c_str(), &sst) == 0) ? (long long)sst.st_size : (long long)st.st_size;
     long timeoutSec = 60 + (long)(sendSize / 1048576) * 8;
     long code = postShot(cfg.hook, payload, sendPath, isVideo ? "video.mp4" : "screenshot.jpg",
-                         isVideo ? "video/mp4" : "image/jpeg", timeoutSec);
+                         isVideo ? "video/mp4" : "image/jpeg", timeoutSec,
+                         iconActive() ? g_curIcon : std::shared_ptr<const std::string>());
     if (trimmed) remove(TRIM_TMP_PATH);  // 一時ファイルは必ず消す
     if (code >= 200 && code < 300) {
         g_lastSent = next;
@@ -590,7 +674,7 @@ static void checkScreenshots(const Config &cfg) {
         else
             snprintf(msg, sizeof(msg), "通信に失敗したため送れませんでした(%.1fMB)。", st.st_size / 1048576.0);
         nxlog("media: 送信をあきらめました %s (http %ld)", next.c_str(), code);
-        std::string d = g_curTitle.empty() ? std::string(msg) : g_curTitle + "\n" + msg;
+        std::string d = withTitle(msg);
         enqueue(embedJson(isVideo ? "🎬 動画(送信失敗)" : "📸 スクリーンショット(送信失敗)", d, 10038562));
         g_lastSent = next;
         g_pendingName.clear();
@@ -608,6 +692,7 @@ static std::string albumReport(const Config &cfg) {
     for (auto &n : names) { if (mediaKind(n) == MK_VIDEO) vid++; else img++; }
     return "Albumを読めました。最新の日の写真: " + std::to_string(img) + "枚 / 動画: " + std::to_string(vid) + "本\n送信できるファイルの上限: " + std::to_string(cfg.limitMB) + "MB\n写真・動画の自動送信: " + (cfg.autoSend ? "オン" : "オフ") +
            "\nゲームの開始・終了の通知: " + (cfg.notify ? "オン" : "オフ") +
+           "\nゲームのアイコン: " + (cfg.icon == 0 ? "なし" : (cfg.icon == 1 ? "左上" : (cfg.icon == 2 ? "右上" : "フッター"))) +
            (cfg.hookName.empty() ? std::string() : "\n送信先: " + cfg.hookName);
 }
 
@@ -632,28 +717,30 @@ int main(int argc, char **argv) {
         }
         if (cfgOk) {
             g_footerOn = cfg.footer;
+            g_iconMode = cfg.icon;
             u64 pid = 0;
             if (!getRunningProgramId(pid)) pid = 0;
 
             if (pid != curPid) {
                 if (curPid != 0 && !startPending && cfg.notify) {
-                    enqueue(embedJson("🏁 プレイ終了", g_curTitle + "\nプレイ時間: " + fmtDuration(nowSec() - startSec), 15158332));
+                    enqueue(embedJson("🏁 プレイ終了", withTitle("プレイ時間: " + fmtDuration(nowSec() - startSec)), 15158332));
                 }
                 nxlog("game: pid=%llX", (unsigned long long)pid);
                 curPid = pid;
                 g_curTitle.clear();
+                g_curIcon.reset();
                 titleTries = 0;
                 startPending = (pid != 0);
                 startSec = nowSec();
             }
             if (startPending) {
-                if (getTitleName(curPid, g_curTitle) || ++titleTries >= 3) {
+                if (getTitleName(curPid, g_curTitle, &g_curIcon) || ++titleTries >= 3) {
                     if (g_curTitle.empty()) {
                         char b[24];
                         snprintf(b, sizeof(b), "%016llX", (unsigned long long)curPid);
                         g_curTitle = b;
                     }
-                    if (cfg.notify) enqueue(embedJson("🎮 ゲームを開始", g_curTitle, 3447003));
+                    if (cfg.notify) enqueue(embedJson("🎮 ゲームを開始", withTitle(""), 3447003));
                     startPending = false;
                 }
             }
