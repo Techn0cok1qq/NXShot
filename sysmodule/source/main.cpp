@@ -702,6 +702,7 @@ static std::string albumReport(const Config &cfg) {
 // 自動送信のオン/オフとは関係なく送る。自動送信の「どこまで送ったか」の印は動かさない。
 #define OVL_REQ_PATH "sdmc:/config/nxdiscord/ovl_send.txt"
 #define OVL_RES_PATH "sdmc:/config/nxdiscord/ovl_result.txt"
+#define OVL_READY_PATH "sdmc:/config/nxdiscord/ovl_ready.txt"
 
 static void writeOvlResult(const char *kind, const std::string &name) {
     FILE *f = fopen(OVL_RES_PATH, "w");
@@ -786,6 +787,12 @@ static void processOverlayRequest(const Config &cfg) {
 int main(int argc, char **argv) {
     nxlog("main: start v" VERSION);
     remove(TRIM_TMP_PATH);  // 前回の一時ファイルが残っていたら消す
+    remove(OVL_REQ_PATH);   // 前の起動で残った依頼は、やらない
+    remove(OVL_RES_PATH);
+    {   // オーバーレイが「この常駐版は、送る依頼に対応している」と分かるための印
+        FILE *rf = fopen(OVL_READY_PATH, "w");
+        if (rf) { fputs("1\n", rf); fclose(rf); }
+    }
     bool cfgLogged = false;
     bool netLogged = false, lastNet = false;
 
@@ -838,7 +845,17 @@ int main(int argc, char **argv) {
                 lastNet = net;
             }
             if (net) initCurl();
-            if (!net || !g_curlReady) { svcSleepThread(POLL_NS); continue; }
+            if (!net || !g_curlReady) {
+                // 通信できないときも、依頼は受け取って、できないと返す(オーバーレイが待ち続けないように)
+                FILE *qf = fopen(OVL_REQ_PATH, "r");
+                if (qf) {
+                    fclose(qf);
+                    remove(OVL_REQ_PATH);
+                    writeOvlResult("net", "");
+                }
+                svcSleepThread(POLL_NS);
+                continue;
+            }
 
             if (!bootDone) {
                 // 起動の確認。これがチャンネルに届けば、通信とWebhookは正常
