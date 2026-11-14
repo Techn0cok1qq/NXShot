@@ -1,6 +1,6 @@
 <img src="NXShot.png" width="200">
 
-# NXShot 1.3.2
+# NXShot 1.3.3
 
 Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)です。
 **Switch単体で**、ゲームの開始・終了と、撮ったスクリーンショットや動画をDiscordのWebhookへ送ります。PCは要りません。
@@ -8,8 +8,8 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 *English: A tiny Atmosphère sysmodule that posts game start/stop notifications and new screenshots/videos straight to a Discord webhook. No PC needed. See the Japanese text below for install steps; the layout is the same as the SD card tree shown there.*
 
 この配布には、2つが入っています。
-- **常駐版**(`exefs.nsp`、版 1.3.2): Switchの裏で動いて、自動で送ります。
-- **アプリ版**(`NXShot.nro`、版 1.3.2): ホームブリューメニューから起動して、昔の写真・動画を送ったり、設定(自動送信のオン/オフなど)を変えたりします。
+- **常駐版**(`exefs.nsp`、版 1.3.3): Switchの裏で動いて、自動で送ります。
+- **アプリ版**(`NXShot.nro`、版 1.3.3): ホームブリューメニューから起動して、昔の写真・動画を送ったり、設定(自動送信のオン/オフなど)を変えたりします。
 
 ## できること
 - ゲームの開始 / 終了(プレイ時間つき)の通知
@@ -19,13 +19,25 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 - **自動送信のオン/オフ**: アプリの設定で切り替えられます(オフの間は、写真・動画を自動では送りません。ゲームの開始・終了の通知は続きます)
 - **アプリ版**: Albumの昔の写真・動画を、**年・月でまとめて**表示します。写真はサムネ付き、動画は最初のコマのサムネと、再生プレビュー付きで選んで送れます。Switchの画面で設定も変えられます。
 
+## オーバーレイ版(NXShot.ovl)
+[Tesla](https://github.com/WerWolv/Tesla-Menu) を入れている人は、**ゲームを遊びながら**、NXShotの設定を変えられます(Teslaメニューを開いて「NXShot」を選びます)。
+- 写真・動画の**自動送信**、ゲームの開始・終了の**通知**、**大きい動画を削る**、通知の下の**NXShot表示**のオン/オフ(`A` で切り替え)
+- **ゲームのアイコン**の位置(`A` で切り替え)
+- **送信先**の切り替え(`hook=` で2つ以上入れているときだけ出ます。名前だけ表示し、URLは出しません)
+- **直近の写真・動画**(新しい順に10件。撮った時刻・写真/動画・大きさ。`A` で開き、`B` で戻ります)
+- **送る上限は20MBに固定**です。オーバーレイを開くと、`config.txt` の `limit=` を `20` にそろえます(オーバーレイからは変えられません。変えたいときはアプリ版か `config.txt` で。ただし、オーバーレイを開くたびに20へ戻ります)
+- 常駐版が動いているかの表示
+- 変えた内容は `config.txt` に保存され、常駐版が5秒ごとに読み直します。Webhook URLの入力や、写真・動画を選んで送る機能は、これまでどおりアプリ版で行います。
+- 入れ場所: `switch/.overlays/NXShot.ovl`。配布zipでは、「.」で始まるフォルダがスマホなどで見えないので、zipの直下の `NXShot.ovl` に入れてあります。これを `switch/.overlays/` へ移動(コピー)してください(Switch側のファイル管理ツールなら、隠しフォルダも見えます)。
+- アプリ版と同時には使えません(アプリ版を開いている間は、Teslaは出ません)。
+
 ## 必要なもの
 - Atmosphère が入ったSwitch
 - Discordのサーバーで作ったWebhook URL(サーバー設定 → 連携サービス → ウェブフック)
 - Wi-Fi(スクショの保存先はSDカード)
 
 ## インストール
-1. [Releases](../../releases) から `NXShot-1.3.2.zip` をダウンロードして展開します。
+1. [Releases](../../releases) から `NXShot-1.3.3.zip` をダウンロードして展開します。
 2. 中の `atmosphere`、`config`、`switch` の3つのフォルダを、SDカードの直下にコピーします。
 3. SDカードの `config/nxdiscord/config.txt` を開き、1行目の `[ここにWebhook URLを貼る]` を、自分のWebhook URLに書き換えて保存します(カッコも消して、URLだけにします)。2行目の `limit=10` はそのままで大丈夫です(下の「動画について」)。
 4. Switchを再起動します。起動してしばらくすると、Discordに「🟢 NXShot 起動」が届きます。
@@ -35,6 +47,7 @@ SDカードの中身はこうなります。
     atmosphere/contents/4200000000000A7E/exefs.nsp
     atmosphere/contents/4200000000000A7E/flags/boot2.flag   (空ファイル)
     switch/NXShot/NXShot.nro                                (アプリ版。ホームブリューメニューに出ます)
+    NXShot.ovl (zipの直下)                                  (オーバーレイ版。Teslaを入れている人だけ。switch/.overlays/ へ移して使います)
     config/nxdiscord/config.txt
         1行目: DiscordのWebhook URL(「名前|URL」とも書けます)
         2行目以降(省略可):
@@ -102,7 +115,7 @@ SDカードの中身はこうなります。
 
 | ログの内容 | 意味 |
 |---|---|
-| `main: start v1.3.2` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
+| `main: start v1.3.3` が無い | 常駐が起動していません。`exefs.nsp` と `boot2.flag` の場所を確認し、Switchを完全に再起動 |
 | `network: 未接続` のまま | Wi-Fiにつながっていません |
 | `curl: global_init=0` 以外 | 通信ライブラリの初期化失敗 |
 | `postJson` / `postShot` の `http 200〜204` | 送信成功 |
@@ -127,6 +140,7 @@ devkitPro(`devkita64`)に libnx と switch-curl が入った環境で次を実�
     make -C app            # アプリ版(要 switch-sdl2 switch-sdl2_ttf switch-sdl2_image。動画のサムネ・プレビューには switch-ffmpeg も)
 
 `sysmodule/out/nxdiscord.nsp` ができるので、`exefs.nsp` という名前でSDカードに置きます。アプリ版は `app/out/NXShot.nro` ができるので、`switch/NXShot/` に置きます。`switch-ffmpeg` が入っていないと、動画のサムネとプレビューが無い版になります(ほかは同じです)。アイコンは `app/icon.jpg`(256x256)です。
+オーバーレイ版は、`git clone --depth 1 https://github.com/WerWolv/libtesla overlay/libtesla` で libtesla を置いてから `make -C overlay` を実行すると、`overlay/out/NXShot.ovl` ができます。
 GitHub Actions(`.github/workflows/build.yml`)でもビルドできます。Releaseを公開すると、配布用zipが自動で添付されます。
 
 ## ライセンス
