@@ -23,7 +23,7 @@
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define POLL_NS 5'000'000'000ULL  // 5秒ごとに確認
 #define DEFAULT_LIMIT_MB 10      // 送信できるファイルの上限(MB)の初期値。config.txtのlimit=で変更可
-#define VERSION "1.3.2"
+#define VERSION "1.3.3"
 #define TRIM_TMP_PATH "sdmc:/config/nxdiscord/trim_tmp.mp4"
 #define LOG_PATH "sdmc:/config/nxdiscord/log.txt"
 #define HOOK_NAME "NX Switch"  // 名前に「discord」を含めるとDiscordに拒否される
