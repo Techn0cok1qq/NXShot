@@ -547,65 +547,60 @@ static int readSendResult() {
 
 // ---- 1件を大きく見て、送る画面 ----
 // 写真: 大きく表示。動画: 中の絵(あれば)を表示。動画の再生は、オーバーレイでは(メモリの都合で)できない。
+// 「送る」は、設定画面のスイッチと同じ、押せる行(ListItem)にしてある(A で送る、B で戻る)。
 class ViewGui : public tsl::Gui {
 public:
     explicit ViewGui(MediaInfo m) : m_m(std::move(m)) {}
 
     tsl::elm::Element *createUI() override {
         auto *frame = new NXFrame(timeLabel(m_m.name));
+        auto *list = new tsl::elm::List();
         if (m_m.video) {
             if (!videoEmbeddedThumb(m_m.path, VIEW_W, VIEW_H, m_bmp)) videoMark(m_bmp, VIEW_W, VIEW_H);
         } else if (!jpegPhoto(m_m.path, VIEW_W, VIEW_H, m_bmp)) {
             fillRGBA(m_bmp, VIEW_W, VIEW_H, 40, 40, 40);
         }
-        m_hint = "A: Discordへ送る    B: もどる";
         auto *pane = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
             (void)h;
             const s32 bx = x + (w - VIEW_W) / 2;
-            r->drawBitmap(bx, y + 14, VIEW_W, VIEW_H, m_bmp.data());
-            const s32 ty = y + 14 + VIEW_H + 34;
-            r->drawString(sizeLabel(m_m).c_str(), false, bx, ty, 22, tsl::Color(15, 15, 15, 15));
-            if (m_m.video) r->drawString("※動画の再生は、アプリ版でできます", false, bx, ty + 30, 17, tsl::Color(10, 10, 10, 15));
-            r->drawString(m_msg.c_str(), false, bx, ty + 66, 20, m_msgColor);
-            r->drawString(m_hint.c_str(), false, bx, ty + 104, 18, tsl::Color(11, 11, 11, 15));
+            r->drawBitmap(bx, y + 10, VIEW_W, VIEW_H, m_bmp.data());
+            r->drawString(sizeLabel(m_m).c_str(), false, bx, y + 10 + VIEW_H + 30, 22, tsl::Color(15, 15, 15, 15));
+            if (m_m.video) r->drawString("※動画の再生は、アプリ版でできます", false, bx, y + 10 + VIEW_H + 58, 17, tsl::Color(10, 10, 10, 15));
         });
-        frame->setContent(pane);
-        return frame;
-    }
+        list->addItem(pane, VIEW_H + 76);
 
-    bool handleInput(u64 keysDown, u64, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
-        if (keysDown & HidNpadButton_B) {
-            tsl::goBack();
+        m_send = new tsl::elm::ListItem("Discordへ送る  Aで送る");
+        m_send->setValue("");
+        m_send->setClickListener([this](u64 keys) {
+            if (!(keys & HidNpadButton_A)) return false;
+            startSend();
             return true;
-        }
-        if (keysDown & HidNpadButton_A) {
-            if (m_pending) return true;  // 送っている最中は、もう一度は送らない
-            if (sysmoduleState() == 0) {
-                setMsg("常駐版が止まっています", true);
-                return true;
-            }
-            if (requestSend(m_m.path)) {
-                m_pending = true;
-                m_since = armGetSystemTick();
-                setMsg("送っています…(しばらくかかります)", false);
-            } else {
-                setMsg("依頼を書けませんでした", true);
-            }
-            return true;
-        }
-        return false;
+        });
+        list->addItem(m_send);
+        frame->setContent(list);
+        return frame;
     }
 
     void update() override {
         if (!m_pending) return;
         int r = readSendResult();
-        if (r == 1) setMsg("送りました", false);
-        else if (r == 2) setMsg("大きすぎて送れませんでした", true);
-        else if (r == 3) setMsg("送れませんでした(通信か送信先)", true);
-        else if (r == 4) setMsg("このファイルは送れません", true);
-        else if (armGetSystemTick() - m_since > armNsToTicks(180000000000ULL)) {
-            setMsg("返事がありません。常駐版を1.3.3にしてください", true);
-            r = 5;
+        if (r == 1) say("送りました");
+        else if (r == 2) say("大きすぎて送れません");
+        else if (r == 3) say("送信に失敗しました");
+        else if (r == 4) say("送れないファイルです");
+        else {
+            u64 el = armGetSystemTick() - m_since;
+            struct stat st;
+            bool stillThere = stat(OVL_REQ_PATH, &st) == 0;
+            if (stillThere && el > armNsToTicks(30000000000ULL)) {
+                // 30秒たっても、依頼のファイルを常駐版が受け取っていない
+                say("常駐版が受け取りません");
+                remove(OVL_REQ_PATH);
+                r = 5;
+            } else if (el > armNsToTicks(240000000000ULL)) {
+                say("結果が分かりません");
+                r = 5;
+            }
         }
         if (r != 0) {
             m_pending = false;
@@ -616,14 +611,27 @@ public:
 private:
     MediaInfo m_m;
     std::vector<u8> m_bmp;
-    std::string m_msg, m_hint;
-    tsl::Color m_msgColor = tsl::Color(15, 15, 15, 15);
+    tsl::elm::ListItem *m_send = nullptr;
     bool m_pending = false;
     u64 m_since = 0;
 
-    void setMsg(const char *s, bool bad) {
-        m_msg = s;
-        m_msgColor = bad ? tsl::Color(15, 8, 6, 15) : tsl::Color(8, 15, 9, 15);
+    void say(const char *s) {
+        if (m_send) m_send->setValue(s);
+    }
+
+    void startSend() {
+        if (m_pending) return;  // 送っている最中は、もう一度は送らない
+        if (sysmoduleState() == 0) {
+            say("常駐版が止まっています");
+            return;
+        }
+        if (requestSend(m_m.path)) {
+            m_pending = true;
+            m_since = armGetSystemTick();
+            say("送っています…");
+        } else {
+            say("依頼を書けません");
+        }
     }
 };
 
