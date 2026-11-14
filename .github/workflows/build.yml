@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: ツールを入れる
-        run: apt-get update && apt-get install -y zip curl git
+        run: apt-get update && apt-get install -y zip curl
 
       - name: 常駐版をビルド
         run: make -C sysmodule
@@ -102,9 +102,10 @@ jobs:
           touch $D/flags/boot2.flag
           printf '[ここにWebhook URLを貼る]\nlimit=10\nauto=1\n' > pkg/config/nxdiscord/config.txt
           # オーバーレイは、ビルドできたときだけ入れる(失敗しても、ほかの配布物は出す)
+          # 「.」で始まるフォルダはiPhoneなどで見えないので、zipの直下に置く。
+          # Teslaで使うときは、switch/.overlays/ へ移す(READMEを参照)
           if [ -f overlay/out/NXShot.ovl ]; then
-            mkdir -p pkg/switch/.overlays
-            cp overlay/out/NXShot.ovl pkg/switch/.overlays/NXShot.ovl
+            cp overlay/out/NXShot.ovl pkg/NXShot.ovl
             cp overlay/out/NXShot.ovl NXShot.ovl
           fi
           cp README.md LICENSE CHANGELOG.md pkg/
