@@ -696,6 +696,92 @@ static std::string albumReport(const Config &cfg) {
            (cfg.hookName.empty() ? std::string() : "\n送信先: " + cfg.hookName);
 }
 
+// ---- オーバーレイからの「この1件を送って」の依頼 ----
+// オーバーレイ(Tesla)が OVL_REQ_PATH に、送りたいファイルのパスを1行で書く。
+// 常駐版はそれを読んで消し、送って、結果を OVL_RES_PATH に書く(1行目: ok / big / fail / bad、2行目: ファイル名)。
+// 自動送信のオン/オフとは関係なく送る。自動送信の「どこまで送ったか」の印は動かさない。
+#define OVL_REQ_PATH "sdmc:/config/nxdiscord/ovl_send.txt"
+#define OVL_RES_PATH "sdmc:/config/nxdiscord/ovl_result.txt"
+
+static void writeOvlResult(const char *kind, const std::string &name) {
+    FILE *f = fopen(OVL_RES_PATH, "w");
+    if (!f) return;
+    fprintf(f, "%s\n%s\n", kind, name.c_str());
+    fclose(f);
+}
+
+static void processOverlayRequest(const Config &cfg) {
+    FILE *f = fopen(OVL_REQ_PATH, "r");
+    if (!f) return;
+    char line[640];
+    line[0] = 0;
+    if (!fgets(line, sizeof(line), f)) line[0] = 0;
+    fclose(f);
+    remove(OVL_REQ_PATH);  // 先に消す(同じ依頼を二度やらない)
+    std::string full = trimLine(line);
+
+    // アルバムの中の jpg / mp4 だけを送る(「..」を含むパスや、ほかの場所のファイルは断る)
+    size_t slash = full.rfind('/');
+    std::string name = (slash == std::string::npos) ? full : full.substr(slash + 1);
+    std::string albumPrefix = cfg.album + "/";
+    int kind = mediaKind(name);
+    if (full.compare(0, albumPrefix.size(), albumPrefix) != 0 || full.find("..") != std::string::npos || kind == MK_NONE) {
+        nxlog("ovl: 依頼を断りました(場所か種類がちがう)");
+        writeOvlResult("bad", name);
+        return;
+    }
+    struct stat st;
+    if (stat(full.c_str(), &st) != 0 || st.st_size <= 0) {
+        nxlog("ovl: ファイルが見つかりません %s", name.c_str());
+        writeOvlResult("bad", name);
+        return;
+    }
+    bool isVideo = kind == MK_VIDEO;
+    nxlog("ovl: 送信の依頼 %s (%lld bytes)", name.c_str(), (long long)st.st_size);
+
+    std::string sendPath = full;
+    std::string note;
+    bool trimmed = false;
+    long long limitBytes = (long long)cfg.limitMB * 1048576LL - 65536;
+    if ((long long)st.st_size > limitBytes) {
+        mp4trim::Info ti;
+        mp4trim::Result tr = mp4trim::ERR_FORMAT;
+        if (isVideo && cfg.trim) tr = mp4trim::trim(full.c_str(), TRIM_TMP_PATH, limitBytes, &ti);
+        if (tr != mp4trim::OK) {
+            remove(TRIM_TMP_PATH);
+            nxlog("ovl: 上限超えで送れません %s", name.c_str());
+            writeOvlResult("big", name);
+            return;
+        }
+        sendPath = TRIM_TMP_PATH;
+        trimmed = true;
+        char nb[200];
+        snprintf(nb, sizeof(nb), "容量の都合で、最初の%.1f秒を削って送りました(%.1fMB→%.1fMB)", ti.cutSeconds,
+                 ti.origSize / 1048576.0, ti.newSize / 1048576.0);
+        note = nb;
+    }
+
+    std::string payload = std::string("{\"username\":\"") + HOOK_NAME + "\",\"embeds\":[{\"title\":\"" +
+                          (isVideo ? "🎬 動画" : "📸 スクリーンショット") + "\"";
+    std::string desc = withTitle("");
+    if (!note.empty()) desc += (desc.empty() ? "" : "\n") + note;
+    if (!desc.empty()) payload += ",\"description\":\"" + jsonEscape(desc) + "\"";
+    payload += ",\"color\":15277667";
+    if (!isVideo) payload += ",\"image\":{\"url\":\"attachment://screenshot.jpg\"}";
+    payload += footerAndIconJson();
+    payload += "}]}";
+
+    struct stat sst;
+    long long sendSize = (stat(sendPath.c_str(), &sst) == 0) ? (long long)sst.st_size : (long long)st.st_size;
+    long timeoutSec = 60 + (long)(sendSize / 1048576) * 8;
+    long code = postShot(cfg.hook, payload, sendPath, isVideo ? "video.mp4" : "screenshot.jpg",
+                         isVideo ? "video/mp4" : "image/jpeg", timeoutSec,
+                         iconActive() ? g_curIcon : std::shared_ptr<const std::string>());
+    if (trimmed) remove(TRIM_TMP_PATH);
+    nxlog("ovl: 送信 http %ld %s", code, name.c_str());
+    writeOvlResult((code >= 200 && code < 300) ? "ok" : "fail", name);
+}
+
 // ---- メイン ----
 int main(int argc, char **argv) {
     nxlog("main: start v" VERSION);
@@ -765,6 +851,7 @@ int main(int argc, char **argv) {
 
             flushQueue(cfg);
             checkScreenshots(cfg);
+            processOverlayRequest(cfg);
         }
         svcSleepThread(POLL_NS);
     }
