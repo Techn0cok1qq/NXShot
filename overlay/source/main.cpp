@@ -44,6 +44,7 @@
 #define OVL_REQ_PATH CONFIG_DIR "/ovl_send.txt"
 #define OVL_REQ_TMP  CONFIG_DIR "/ovl_send.txt.tmp"
 #define OVL_RES_PATH CONFIG_DIR "/ovl_result.txt"
+#define OVL_READY_PATH CONFIG_DIR "/ovl_ready.txt"
 #define VIEW_W 288  // 大きく見るときの絵の大きさ(16:9)
 #define VIEW_H 162
 #define THUMB_W 106  // サムネの大きさ(16:9)
@@ -530,7 +531,7 @@ static bool requestSend(const std::string &path) {
     return true;
 }
 
-// 結果: 0 まだ / 1 送れた / 2 大きすぎ / 3 失敗 / 4 送れないファイル
+// 結果: 0 まだ / 1 送れた / 2 大きすぎ / 3 失敗 / 4 送れないファイル / 6 通信できない
 static int readSendResult() {
     FILE *f = fopen(OVL_RES_PATH, "r");
     if (!f) return 0;
@@ -542,6 +543,7 @@ static int readSendResult() {
     if (t == "big") return 2;
     if (t == "fail") return 3;
     if (t == "bad") return 4;
+    if (t == "net") return 6;
     return 0;
 }
 
@@ -588,13 +590,17 @@ public:
         else if (r == 2) say("大きすぎて送れません");
         else if (r == 3) say("送信に失敗しました");
         else if (r == 4) say("送れないファイルです");
+        else if (r == 6) say("通信できません(Wi-Fi)");
         else {
             u64 el = armGetSystemTick() - m_since;
             struct stat st;
             bool stillThere = stat(OVL_REQ_PATH, &st) == 0;
             if (stillThere && el > armNsToTicks(30000000000ULL)) {
-                // 30秒たっても、依頼のファイルを常駐版が受け取っていない
-                say("常駐版が受け取りません");
+                // 30秒たっても、依頼のファイルを常駐版が受け取っていない。
+                // 「対応しています」の印(ovl_ready.txt)が無ければ、古い常駐版のまま(入れ替え+再起動が要る)
+                struct stat rs;
+                if (stat(OVL_READY_PATH, &rs) != 0) say("常駐版が古い(入替+再起動)");
+                else say("常駐版が反応しません");
                 remove(OVL_REQ_PATH);
                 r = 5;
             } else if (el > armNsToTicks(240000000000ULL)) {
