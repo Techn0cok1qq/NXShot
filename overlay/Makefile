@@ -2,6 +2,7 @@
 # NXShot オーバーレイ(.ovl) Makefile (devkitPro / libnx / libtesla)
 # 使い方: overlay/libtesla に libtesla を置いて(下の「準備」)、`make -C overlay`
 #         → out/NXShot.ovl ができる
+# 必要:   switch-libjpeg-turbo(サムネ用。switch-sdl2_image を入れると、いっしょに入る)
 # 準備:   git clone --depth 1 https://github.com/WerWolv/libtesla overlay/libtesla
 #---------------------------------------------------------------------------------
 .SUFFIXES:
@@ -20,7 +21,7 @@ OUT      := out
 
 APP_TITLE   := NXShot
 APP_AUTHOR  := Cokacolastic
-APP_VERSION := 1.0.0
+APP_VERSION := 1.3.3
 
 LIBTESLA ?= $(CURDIR)/libtesla
 
@@ -30,7 +31,7 @@ CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) $(INCLUDE) -D__S
 CXXFLAGS := $(CFLAGS) -fno-exceptions -std=gnu++20
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
-LIBS     := -lnx -lm
+LIBS     := -ljpeg -lnx -lm
 LIBDIRS  := $(PORTLIBS) $(LIBNX)
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
