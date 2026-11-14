@@ -7,7 +7,8 @@
 //   ・自動送信(auto=) / ゲームの通知(notify=) / フッター(footer=) / 動画を削る(trim=)
 //   ・ゲームのアイコン位置(icon=) / 送信先(use=)
 //   ・送る上限は 20MB に固定(開いたときに limit=20 にそろえる。画面では変えられない)
-//   ・直近の写真・動画(最大10件)の一覧(写真はサムネ付き。動画は印だけ)
+//   ・直近の写真・動画(最大10件)の一覧(サムネ付き。Aで開いて、大きく見る・送る)
+//     送るときは ovl_send.txt に依頼を書き、常駐版(1.3.3以降)が送る。結果は ovl_result.txt に返る
 //   ・常駐版が動いているかの表示
 //
 // config.txt は、書き換えたい行だけを直す(1行目のWebhook、hook=、album=、コメントなどは、そのまま残す)。
@@ -40,6 +41,11 @@
 #define FIXED_LIMIT_MB 20  // オーバーレイでは、送る上限を20MBに固定する
 #define DEFAULT_ALBUM "sdmc:/Nintendo/Album"
 #define RECENT_COUNT 10
+#define OVL_REQ_PATH CONFIG_DIR "/ovl_send.txt"
+#define OVL_REQ_TMP  CONFIG_DIR "/ovl_send.txt.tmp"
+#define OVL_RES_PATH CONFIG_DIR "/ovl_result.txt"
+#define VIEW_W 288  // 大きく見るときの絵の大きさ(16:9)
+#define VIEW_H 162
 #define THUMB_W 106  // サムネの大きさ(16:9)
 #define THUMB_H 60
 
@@ -301,24 +307,29 @@ static void jerrExit(j_common_ptr c) {
     longjmp(((JErr *)c->err)->jb, 1);
 }
 
-static void fillThumb(std::vector<u8> &out, u8 r, u8 g, u8 b) {
-    out.assign((size_t)THUMB_W * THUMB_H * 4, 255);
-    for (size_t i = 0; i < (size_t)THUMB_W * THUMB_H; i++) {
+static void fillRGBA(std::vector<u8> &out, int w, int h, u8 r, u8 g, u8 b) {
+    out.assign((size_t)w * h * 4, 255);
+    for (size_t i = 0; i < (size_t)w * h; i++) {
         out[i * 4 + 0] = r;
         out[i * 4 + 1] = g;
         out[i * 4 + 2] = b;
     }
 }
 
-// 動画の印(暗い地に、再生マーク)。動画の最初のコマは、オーバーレイでは取り出せないので、これで代わりにする
-static void videoThumb(std::vector<u8> &out) {
-    fillThumb(out, 28, 28, 42);
-    const int cx = THUMB_W / 2 - 4, cy = THUMB_H / 2;
-    for (int x = cx - 10; x <= cx + 12; x++) {
-        int half = (cx + 12 - x) * 16 / 22;
+static void fillThumb(std::vector<u8> &out, u8 r, u8 g, u8 b) {
+    fillRGBA(out, THUMB_W, THUMB_H, r, g, b);
+}
+
+// 動画の印(暗い地に、再生マーク)。動画の中に絵が見つからなかったときの代わり
+static void videoMark(std::vector<u8> &out, int w, int h) {
+    fillRGBA(out, w, h, 28, 28, 42);
+    const int tri = h * 27 / 100;  // 三角の高さの半分
+    const int cx = w / 2 - tri / 3, cy = h / 2;
+    for (int x = cx - tri * 2 / 3; x <= cx + tri * 4 / 3; x++) {
+        int half = (cx + tri * 4 / 3 - x) * tri / (tri * 2);
         for (int y = cy - half; y <= cy + half; y++) {
-            if (y < 0 || y >= THUMB_H) continue;
-            size_t k = ((size_t)y * THUMB_W + (size_t)x) * 4;
+            if (x < 0 || x >= w || y < 0 || y >= h) continue;
+            size_t k = ((size_t)y * w + (size_t)x) * 4;
             out[k + 0] = 235;
             out[k + 1] = 235;
             out[k + 2] = 245;
@@ -326,9 +337,22 @@ static void videoThumb(std::vector<u8> &out) {
     }
 }
 
-static bool jpegThumb(const std::string &path, std::vector<u8> &out) {
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) return false;
+// JPEG を tw x th の絵(RGBA 各8bit)にする。読み込み元は、ファイルでもメモリでもよい。
+// libjpeg の縮小読み込み(1/8 など)を使うので、速く、メモリも少なくて済む。
+typedef void (*JSrcFn)(jpeg_decompress_struct *, void *);
+
+struct MemBuf {
+    const u8 *p;
+    size_t n;
+};
+
+static void srcFile(jpeg_decompress_struct *ci, void *arg) { jpeg_stdio_src(ci, (FILE *)arg); }
+static void srcMem(jpeg_decompress_struct *ci, void *arg) {
+    MemBuf *m = (MemBuf *)arg;
+    jpeg_mem_src(ci, m->p, (unsigned long)m->n);
+}
+
+static bool jpegDecode(JSrcFn setSrc, void *arg, int tw, int th, int minW, std::vector<u8> &out) {
     jpeg_decompress_struct ci;
     JErr je;
     u8 *volatile row = nullptr;  // longjmp をまたぐので、C流に確保する
@@ -337,15 +361,18 @@ static bool jpegThumb(const std::string &path, std::vector<u8> &out) {
     if (setjmp(je.jb)) {
         jpeg_destroy_decompress(&ci);
         if (row) free(row);
-        fclose(f);
         return false;
     }
     jpeg_create_decompress(&ci);
-    jpeg_stdio_src(&ci, f);
+    setSrc(&ci, arg);
     jpeg_read_header(&ci, TRUE);
-    // サムネより小さくならない範囲で、いちばん小さく読む(1/1, 1/2, 1/4, 1/8)
+    if ((int)ci.image_width < minW) {  // 小さすぎる絵は、動画の中のたまたまの並びとみなして捨てる
+        jpeg_destroy_decompress(&ci);
+        return false;
+    }
+    // 出す大きさより小さくならない範囲で、いちばん小さく読む(1/1, 1/2, 1/4, 1/8)
     int d = 8;
-    while (d > 1 && (ci.image_width / (unsigned)d < (unsigned)THUMB_W || ci.image_height / (unsigned)d < (unsigned)THUMB_H)) d /= 2;
+    while (d > 1 && (ci.image_width / (unsigned)d < (unsigned)tw || ci.image_height / (unsigned)d < (unsigned)th)) d /= 2;
     ci.scale_num = 1;
     ci.scale_denom = (unsigned)d;
     ci.out_color_space = JCS_RGB;
@@ -353,27 +380,25 @@ static bool jpegThumb(const std::string &path, std::vector<u8> &out) {
     const int w = (int)ci.output_width, h = (int)ci.output_height;
     if (ci.output_components != 3 || w < 1 || h < 1) {
         jpeg_destroy_decompress(&ci);
-        fclose(f);
         return false;
     }
     row = (u8 *)malloc((size_t)w * 3);
     if (!row) {
         jpeg_destroy_decompress(&ci);
-        fclose(f);
         return false;
     }
-    fillThumb(out, 0, 0, 0);
+    fillRGBA(out, tw, th, 0, 0, 0);
     int sy = 0;
-    for (int dy = 0; dy < THUMB_H; dy++) {
-        int want = dy * h / THUMB_H;
+    for (int dy = 0; dy < th; dy++) {
+        int want = dy * h / th;
         while (sy <= want) {
             JSAMPROW rp = row;
             jpeg_read_scanlines(&ci, &rp, 1);
             sy++;
         }
-        for (int dx = 0; dx < THUMB_W; dx++) {
-            int sx = dx * w / THUMB_W;
-            size_t k = ((size_t)dy * THUMB_W + (size_t)dx) * 4;
+        for (int dx = 0; dx < tw; dx++) {
+            int sx = dx * w / tw;
+            size_t k = ((size_t)dy * tw + (size_t)dx) * 4;
             out[k + 0] = row[sx * 3 + 0];
             out[k + 1] = row[sx * 3 + 1];
             out[k + 2] = row[sx * 3 + 2];
@@ -382,8 +407,51 @@ static bool jpegThumb(const std::string &path, std::vector<u8> &out) {
     jpeg_abort_decompress(&ci);
     jpeg_destroy_decompress(&ci);
     free(row);
-    fclose(f);
     return true;
+}
+
+// 写真(JPEG)を、tw x th の絵にする
+static bool jpegPhoto(const std::string &path, int tw, int th, std::vector<u8> &out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    bool ok = jpegDecode(srcFile, f, tw, th, 0, out);
+    fclose(f);
+    return ok;
+}
+
+// 動画(mp4)の中に付いている絵(JPEG)を探して、絵にする。
+// オーバーレイには動画をひらく部品が入っていない(メモリが足りない)ので、
+// ファイルのおしりのほうにある JPEG を探す。見つからなければ false(呼ぶほうが、再生マークで代わりにする)
+static bool videoEmbeddedThumb(const std::string &path, int tw, int th, std::vector<u8> &out) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f);
+    const long TAIL = 131072;
+    long n = sz < TAIL ? sz : TAIL;
+    if (n < 1024 || fseek(f, sz - n, SEEK_SET) != 0) { fclose(f); return false; }
+    std::vector<u8> buf((size_t)n);
+    size_t got = fread(buf.data(), 1, (size_t)n, f);
+    fclose(f);
+    if (got < 1024) return false;
+    int tries = 0;
+    for (long i = (long)got - 4; i >= 0 && tries < 6; i--) {  // うしろから探す(いちばん後ろのものが、本物のことが多い)
+        if (buf[(size_t)i] == 0xFF && buf[(size_t)i + 1] == 0xD8 && buf[(size_t)i + 2] == 0xFF) {
+            tries++;
+            MemBuf mb{buf.data() + i, got - (size_t)i};
+            if (jpegDecode(srcMem, &mb, tw, th, 160, out)) return true;
+        }
+    }
+    return false;
+}
+
+// 一覧用のサムネ(写真は縮小、動画は中の絵。どちらもだめなら、印)
+static void makeThumb(const MediaInfo &m, std::vector<u8> &bmp) {
+    if (m.video) {
+        if (!videoEmbeddedThumb(m.path, THUMB_W, THUMB_H, bmp)) videoMark(bmp, THUMB_W, THUMB_H);
+    } else if (!jpegPhoto(m.path, THUMB_W, THUMB_H, bmp)) {
+        fillThumb(bmp, 40, 40, 40);  // 読めなかった写真は、灰色の四角
+    }
 }
 
 // ---- 画面の枠(「NXShot」の文字を、アイコンのグラデーションにする) ----
@@ -409,14 +477,23 @@ public:
 
     void draw(tsl::gfx::Renderer *renderer) override {
         tsl::elm::OverlayFrame::draw(renderer);
-        static const char *CH[] = {"N", "X", "S", "h", "o", "t"};
-        const int n = 6;
-        s32 x = 20;
-        for (int i = 0; i < n; i++) {
-            // drawString は、描いた文字の幅(横の長さ)を返すので、その分だけ右へ進める
-            auto dim = renderer->drawString(CH[i], false, x, 50, 32, gradColor(i, n));
-            x += (s32)dim.first;
+        // 1文字ずつ描くと、文字の幅の取り方によっては N X S が重なって崩れる。
+        // なので「NXShot」は必ず1度に(文字の間隔は、ふつうの文字と同じに)描き、
+        // 色の変化は、縦に細く切った帯ごとに、画面の描く範囲を絞って(scissor)つける。
+        const char *TITLE = "NXShot";
+        const s32 X0 = 20, Y = 50, SZ = 32;
+        // いちど透明で描いて、文字の形を準備しつつ、幅を測る(測れなかったときは、標準の幅を使う)
+        auto dim = renderer->drawString(TITLE, false, X0, Y, SZ, tsl::Color(0, 0, 0, 0));
+        s32 W = (s32)dim.first;
+        if (W < 80 || W > 220) W = 125;
+        const int BANDS = 12;
+        for (int i = 0; i < BANDS; i++) {
+            s32 x0 = X0 + W * i / BANDS;
+            s32 x1 = (i == BANDS - 1) ? X0 + W + 40 : X0 + W * (i + 1) / BANDS;
+            renderer->enableScissoring(x0, 10, x1 - x0, 62);
+            renderer->drawString(TITLE, false, X0, Y, SZ, gradColor(i, BANDS));
         }
+        renderer->disableScissoring();
     }
 };
 
@@ -440,6 +517,116 @@ private:
     std::vector<u8> m_bmp;
 };
 
+// ---- 送る依頼(常駐版 1.3.3 以降が、ovl_send.txt を読んで送る) ----
+static bool requestSend(const std::string &path) {
+    remove(OVL_RES_PATH);  // 前の結果を消す
+    FILE *f = fopen(OVL_REQ_TMP, "w");
+    if (!f) return false;
+    bool ok = fprintf(f, "%s\n", path.c_str()) > 0;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) { remove(OVL_REQ_TMP); return false; }
+    remove(OVL_REQ_PATH);
+    if (rename(OVL_REQ_TMP, OVL_REQ_PATH) != 0) { remove(OVL_REQ_TMP); return false; }
+    return true;
+}
+
+// 結果: 0 まだ / 1 送れた / 2 大きすぎ / 3 失敗 / 4 送れないファイル
+static int readSendResult() {
+    FILE *f = fopen(OVL_RES_PATH, "r");
+    if (!f) return 0;
+    char line[64] = {0};
+    if (!fgets(line, sizeof(line), f)) line[0] = 0;
+    fclose(f);
+    std::string t = trimLine(line);
+    if (t == "ok") return 1;
+    if (t == "big") return 2;
+    if (t == "fail") return 3;
+    if (t == "bad") return 4;
+    return 0;
+}
+
+// ---- 1件を大きく見て、送る画面 ----
+// 写真: 大きく表示。動画: 中の絵(あれば)を表示。動画の再生は、オーバーレイでは(メモリの都合で)できない。
+class ViewGui : public tsl::Gui {
+public:
+    explicit ViewGui(MediaInfo m) : m_m(std::move(m)) {}
+
+    tsl::elm::Element *createUI() override {
+        auto *frame = new NXFrame(timeLabel(m_m.name));
+        if (m_m.video) {
+            if (!videoEmbeddedThumb(m_m.path, VIEW_W, VIEW_H, m_bmp)) videoMark(m_bmp, VIEW_W, VIEW_H);
+        } else if (!jpegPhoto(m_m.path, VIEW_W, VIEW_H, m_bmp)) {
+            fillRGBA(m_bmp, VIEW_W, VIEW_H, 40, 40, 40);
+        }
+        m_hint = "A: Discordへ送る    B: もどる";
+        auto *pane = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+            (void)h;
+            const s32 bx = x + (w - VIEW_W) / 2;
+            r->drawBitmap(bx, y + 14, VIEW_W, VIEW_H, m_bmp.data());
+            const s32 ty = y + 14 + VIEW_H + 34;
+            r->drawString(sizeLabel(m_m).c_str(), false, bx, ty, 22, tsl::Color(15, 15, 15, 15));
+            if (m_m.video) r->drawString("※動画の再生は、アプリ版でできます", false, bx, ty + 30, 17, tsl::Color(10, 10, 10, 15));
+            r->drawString(m_msg.c_str(), false, bx, ty + 66, 20, m_msgColor);
+            r->drawString(m_hint.c_str(), false, bx, ty + 104, 18, tsl::Color(11, 11, 11, 15));
+        });
+        frame->setContent(pane);
+        return frame;
+    }
+
+    bool handleInput(u64 keysDown, u64, const HidTouchState &, HidAnalogStickState, HidAnalogStickState) override {
+        if (keysDown & HidNpadButton_B) {
+            tsl::goBack();
+            return true;
+        }
+        if (keysDown & HidNpadButton_A) {
+            if (m_pending) return true;  // 送っている最中は、もう一度は送らない
+            if (sysmoduleState() == 0) {
+                setMsg("常駐版が止まっています", true);
+                return true;
+            }
+            if (requestSend(m_m.path)) {
+                m_pending = true;
+                m_since = armGetSystemTick();
+                setMsg("送っています…(しばらくかかります)", false);
+            } else {
+                setMsg("依頼を書けませんでした", true);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    void update() override {
+        if (!m_pending) return;
+        int r = readSendResult();
+        if (r == 1) setMsg("送りました", false);
+        else if (r == 2) setMsg("大きすぎて送れませんでした", true);
+        else if (r == 3) setMsg("送れませんでした(通信か送信先)", true);
+        else if (r == 4) setMsg("このファイルは送れません", true);
+        else if (armGetSystemTick() - m_since > armNsToTicks(180000000000ULL)) {
+            setMsg("返事がありません。常駐版を1.3.3にしてください", true);
+            r = 5;
+        }
+        if (r != 0) {
+            m_pending = false;
+            remove(OVL_RES_PATH);
+        }
+    }
+
+private:
+    MediaInfo m_m;
+    std::vector<u8> m_bmp;
+    std::string m_msg, m_hint;
+    tsl::Color m_msgColor = tsl::Color(15, 15, 15, 15);
+    bool m_pending = false;
+    u64 m_since = 0;
+
+    void setMsg(const char *s, bool bad) {
+        m_msg = s;
+        m_msgColor = bad ? tsl::Color(15, 8, 6, 15) : tsl::Color(8, 15, 9, 15);
+    }
+};
+
 // ---- 直近の写真・動画の画面 ----
 class RecentGui : public tsl::Gui {
 public:
@@ -448,7 +635,7 @@ public:
     tsl::elm::Element *createUI() override {
         auto *frame = new NXFrame("直近の写真・動画");
         auto *list = new tsl::elm::List();
-        list->addItem(new tsl::elm::CategoryHeader("新しい順(最大" + std::to_string(RECENT_COUNT) + "件)"));
+        list->addItem(new tsl::elm::CategoryHeader("新しい順(最大" + std::to_string(RECENT_COUNT) + "件)  Aで開く"));
         std::vector<MediaInfo> v = recentMedia(m_album, RECENT_COUNT);
         if (v.empty()) {
             auto *none = new tsl::elm::ListItem("見つかりません");
@@ -457,10 +644,16 @@ public:
         }
         for (auto &m : v) {
             std::vector<u8> bmp;
-            if (m.video) videoThumb(bmp);
-            else if (!jpegThumb(m.path, bmp)) fillThumb(bmp, 40, 40, 40);  // 読めなかった写真は、灰色の四角
+            makeThumb(m, bmp);
             bool over = m.size > (long long)FIXED_LIMIT_MB * 1048576LL;
-            list->addItem(new MediaItem(timeLabel(m.name), sizeLabel(m), over, std::move(bmp)));
+            auto *item = new MediaItem(timeLabel(m.name), sizeLabel(m), over, std::move(bmp));
+            MediaInfo mc = m;
+            item->setClickListener([mc](u64 keys) {
+                if (!(keys & HidNpadButton_A)) return false;
+                tsl::changeTo<ViewGui>(mc);
+                return true;
+            });
+            list->addItem(item);
         }
         frame->setContent(list);
         return frame;
