@@ -18,7 +18,7 @@ DATA     :=
 INCLUDES :=
 OUT      := out
 
-APP_VERSION := 1.1.2
+APP_VERSION := 1.3.3
 ARCH     := -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
 CFLAGS   := -g -Wall -O2 -ffunction-sections $(ARCH) $(DEFINES) $(INCLUDE) -D__SWITCH__
 CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++20
