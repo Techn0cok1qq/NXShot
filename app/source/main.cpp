@@ -35,7 +35,7 @@ extern "C" {
 #include "imgops.h"
 #include "pngsave.h"
 
-#define APP_VERSION_STR "1.3.2"
+#define APP_VERSION_STR "1.3.3"
 #define CONFIG_DIR "sdmc:/config/nxdiscord"
 #define CONFIG_PATH "sdmc:/config/nxdiscord/config.txt"
 #define SYS_LOG_PATH "sdmc:/config/nxdiscord/log.txt"
