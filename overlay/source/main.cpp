@@ -411,11 +411,11 @@ public:
         tsl::elm::OverlayFrame::draw(renderer);
         static const char *CH[] = {"N", "X", "S", "h", "o", "t"};
         const int n = 6;
-        std::string prefix;
+        s32 x = 20;
         for (int i = 0; i < n; i++) {
-            s32 off = prefix.empty() ? 0 : renderer->getTextDimensions(prefix, false, 32).first;
-            renderer->drawString(CH[i], false, 20 + off, 50, 32, gradColor(i, n));
-            prefix += CH[i];
+            // drawString は、描いた文字の幅(横の長さ)を返すので、その分だけ右へ進める
+            auto dim = renderer->drawString(CH[i], false, x, 50, 32, gradColor(i, n));
+            x += (s32)dim.first;
         }
     }
 };
@@ -428,8 +428,8 @@ public:
 
     void draw(tsl::gfx::Renderer *r) override {
         const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
-        r->drawString(m_time, false, x + 16, y + h * 43 / 100, 22, tsl::Color(15, 15, 15, 15));
-        r->drawString(m_sub, false, x + 16, y + h * 78 / 100, 17, m_warn ? tsl::Color(15, 12, 4, 15) : tsl::Color(10, 10, 10, 15));
+        r->drawString(m_time.c_str(), false, x + 16, y + h * 43 / 100, 22, tsl::Color(15, 15, 15, 15));
+        r->drawString(m_sub.c_str(), false, x + 16, y + h * 78 / 100, 17, m_warn ? tsl::Color(15, 12, 4, 15) : tsl::Color(10, 10, 10, 15));
         if (!m_bmp.empty()) r->drawBitmap(x + w - THUMB_W - 12, y + (h - THUMB_H) / 2, THUMB_W, THUMB_H, m_bmp.data());
         r->drawRect(x, y + h - 1, w, 1, tsl::Color(5, 5, 5, 15));
     }
