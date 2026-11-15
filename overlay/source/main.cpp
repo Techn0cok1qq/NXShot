@@ -465,54 +465,16 @@ static const s32 FB_W = 448, FB_H = 720;
 
 static tsl::Color C(u8 r, u8 g, u8 b, u8 a = 15) { return tsl::Color(r, g, b, a); }
 
-static const tsl::Color COL_BG    = tsl::Color(1, 0, 4, 15);     // 地: 濃い紺
+static const tsl::Color COL_BG    = tsl::Color(1, 1, 2, 15);     // 地: ほぼ黒(ほんの少しだけ青)
+static const tsl::Color COL_PANEL = tsl::Color(3, 3, 5, 15);     // カード・選んだ行の地
 static const tsl::Color COL_TEXT  = tsl::Color(15, 15, 15, 15);  // ふつうの文字
-static const tsl::Color COL_SUB   = tsl::Color(11, 10, 15, 15);  // 小さい文字(薄い紫)
-static const tsl::Color COL_VALUE = tsl::Color(6, 14, 15, 15);   // 右側の値(青緑)
+static const tsl::Color COL_SUB   = tsl::Color(10, 10, 12, 15);  // 小さい文字(灰色)
+static const tsl::Color COL_VALUE = tsl::Color(14, 11, 14, 15);  // 右側の値(うすいピンク)
+static const tsl::Color COL_ACC   = tsl::Color(13, 5, 10, 15);   // 目印の色(NXShotのピンク)
 static const tsl::Color COL_GOOD  = tsl::Color(7, 15, 9, 15);
 static const tsl::Color COL_BAD   = tsl::Color(15, 7, 7, 15);
 static const tsl::Color COL_WARN  = tsl::Color(15, 13, 4, 15);
-static const tsl::Color COL_LINE  = tsl::Color(4, 3, 9, 15);     // 行の区切り
-
-// 色相(0〜1)から、少し白を混ぜた明るい色
-static float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
-static tsl::Color hueColor(float h) {
-    h -= floorf(h);
-    float r = clamp01(fabsf(h * 6.f - 3.f) - 1.f);
-    float g = clamp01(2.f - fabsf(h * 6.f - 2.f));
-    float b = clamp01(2.f - fabsf(h * 6.f - 4.f));
-    r = 0.2f + 0.8f * r;
-    g = 0.2f + 0.8f * g;
-    b = 0.2f + 0.8f * b;
-    return tsl::Color((u8)(r * 15.f + 0.5f), (u8)(g * 15.f + 0.5f), (u8)(b * 15.f + 0.5f), 15);
-}
-
-// 虹色の流れる速さ(8秒で1周)
-static float animPhase() {
-    u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ULL;
-    return (float)(ms % 8000ULL) / 8000.f;
-}
-
-static void rainbowLine(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 t, float phase) {
-    for (s32 i = 0; i < w; i += 8) {
-        s32 sw = (w - i < 8) ? (w - i) : 8;
-        r->drawRect(x + i, y, sw, t, hueColor(phase + (float)i / (float)w));
-    }
-}
-
-static void rainbowBox(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h, s32 t, float phase) {
-    const float total = (float)(2 * (w + h));
-    for (s32 i = 0; i < w; i += 8) {
-        s32 sw = (w - i < 8) ? (w - i) : 8;
-        r->drawRect(x + i, y, sw, t, hueColor(phase + (float)i / total));                              // 上
-        r->drawRect(x + w - i - sw, y + h - t, sw, t, hueColor(phase + (float)(w + h + i) / total));  // 下
-    }
-    for (s32 j = 0; j < h; j += 8) {
-        s32 sh = (h - j < 8) ? (h - j) : 8;
-        r->drawRect(x + w - t, y + j, t, sh, hueColor(phase + (float)(w + j) / total));                // 右
-        r->drawRect(x, y + h - j - sh, t, sh, hueColor(phase + (float)(2 * w + h + j) / total));      // 左
-    }
-}
+static const tsl::Color COL_LINE  = tsl::Color(3, 3, 5, 15);     // 行の区切り
 
 // 題の色: アイコンの「N」(ピンク→紫)から、右上の丸(青みのある紫)へ
 static tsl::Color gradColor(int i, int n) {
@@ -528,8 +490,40 @@ static tsl::Color gradColor(int i, int n) {
     return tsl::Color(c[0], c[1], c[2], 15);
 }
 
+// ピンク→紫の横線(静止)
+static void gradLine(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 t) {
+    const int N = 24;
+    for (int i = 0; i < N; i++) {
+        s32 x0 = x + w * i / N, x1 = x + w * (i + 1) / N;
+        r->drawRect(x0, y, x1 - x0, t, gradColor(i, N));
+    }
+}
+
+// 虹色の線(題の下)。色相から、少し白を混ぜた明るい色にして、8秒で1周ゆっくり流す
+static float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+static tsl::Color hueColor(float h) {
+    h -= floorf(h);
+    float r = clamp01(fabsf(h * 6.f - 3.f) - 1.f);
+    float g = clamp01(2.f - fabsf(h * 6.f - 2.f));
+    float b = clamp01(2.f - fabsf(h * 6.f - 4.f));
+    r = 0.2f + 0.8f * r;
+    g = 0.2f + 0.8f * g;
+    b = 0.2f + 0.8f * b;
+    return tsl::Color((u8)(r * 15.f + 0.5f), (u8)(g * 15.f + 0.5f), (u8)(b * 15.f + 0.5f), 15);
+}
+
+static void rainbowLine(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 t) {
+    u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ULL;
+    float phase = (float)(ms % 8000ULL) / 8000.f;
+    for (s32 i = 0; i < w; i += 8) {
+        s32 sw = (w - i < 8) ? (w - i) : 8;
+        r->drawRect(x + i, y, sw, t, hueColor(phase + (float)i / (float)w));
+    }
+}
+
 // 「NXShot」を、必ず1度に描く(1文字ずつだと文字の幅の取り方で重なることがあった)。
 // 色の変化は、縦に細く切った帯ごとに、描く範囲を絞って(scissor)つける。
+// ※ scissor は「入れたら、必ずその場で出す」(入れっぱなしにすると、あとの描画が切り取られる)
 static void drawTitle(tsl::gfx::Renderer *r) {
     const char *TITLE = "NXShot";
     const s32 X0 = 20, Y = 50, SZ = 34;
@@ -542,8 +536,8 @@ static void drawTitle(tsl::gfx::Renderer *r) {
         s32 x1 = (i == BANDS - 1) ? X0 + W + 40 : X0 + W * (i + 1) / BANDS;
         r->enableScissoring(x0, 8, x1 - x0, 62);
         r->drawString(TITLE, false, X0, Y, SZ, gradColor(i, BANDS));
+        r->disableScissoring();
     }
-    r->disableScissoring();
 }
 
 // ---- 画面の枠(地・題・虹色の線・下の案内を自分で描く) ----
@@ -559,16 +553,15 @@ public:
 
     void draw(tsl::gfx::Renderer *r) override {
         r->fillScreen(COL_BG);
-        r->drawRect(FB_W - 1, 0, 1, FB_H, C(8, 4, 15));
         drawTitle(r);
         r->drawString(m_sub.c_str(), false, 21, 74, 16, COL_SUB);
-        rainbowLine(r, 12, 90, FB_W - 24, 2, animPhase());
+        rainbowLine(r, 20, 88, FB_W - 40, 2);
         if (m_nx) m_nx->frame(r);
         // 下の案内(中身が下にはみ出しても隠れるよう、あとから描く)
         r->drawRect(0, FB_H - 74, FB_W, 74, COL_BG);
-        r->drawRect(15, FB_H - 73, FB_W - 30, 1, C(9, 5, 14));
-        r->drawString("\uE0E1  戻る", false, 30, 693, 23, C(15, 12, 15));
-        r->drawString("\uE0E0  OK", false, 200, 693, 23, C(15, 12, 15));
+        r->drawRect(20, FB_H - 73, FB_W - 40, 1, C(5, 5, 7));
+        r->drawString("\uE0E1  戻る", false, 30, 693, 22, COL_SUB);
+        r->drawString("\uE0E0  OK", false, 200, 693, 22, COL_SUB);
     }
 
     // 中身を、題のすぐ下(虹色の線のあと)から始める
@@ -585,21 +578,14 @@ private:
     tsl::elm::Element *m_nx = nullptr;
 };
 
-// ---- 行の土台: 選んでいる行は、紫で塗って、ピンクの枠を付ける ----
+// ---- 行の土台: 選んでいる行は、薄い地を敷いて、左に太い目印を付ける ----
 class NXItem : public tsl::elm::ListItem {
 public:
     NXItem() : tsl::elm::ListItem("") {}
 
     // Tesla が、選んでいる行の「下地」と「枠」を描くときに呼ぶ(標準の見た目の代わり)
-    void drawFocusBackground(tsl::gfx::Renderer *r) { r->drawRect(getX(), getY(), getWidth(), getHeight(), C(5, 1, 11, 12)); }
-    void drawHighlight(tsl::gfx::Renderer *r) {
-        const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
-        tsl::Color c = C(14, 4, 14, 15);
-        r->drawRect(x, y, w, 2, c);
-        r->drawRect(x, y + h - 2, w, 2, c);
-        r->drawRect(x, y, 2, h, c);
-        r->drawRect(x + w - 2, y, 2, h, c);
-    }
+    void drawFocusBackground(tsl::gfx::Renderer *r) { r->drawRect(getX(), getY(), getWidth(), getHeight(), C(4, 4, 6, 15)); }
+    void drawHighlight(tsl::gfx::Renderer *r) { r->drawRect(getX(), getY() + 4, 4, getHeight() - 8, COL_ACC); }
 };
 
 // 文字の幅(透明で描いて測る。測れなかったときは、文字数からの見積もり)
@@ -633,10 +619,10 @@ public:
 
     void draw(tsl::gfx::Renderer *r) override {
         const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
-        r->drawString(m_label.c_str(), false, x + 16, y + h * 62 / 100, 22, COL_TEXT);
+        r->drawString(m_label.c_str(), false, x + 18, y + h * 62 / 100, 22, COL_TEXT);
         if (m_toggle) {
             const s32 tw = 50, th = 24, tx = x + w - 16 - tw, ty = y + (h - th) / 2;
-            r->drawRect(tx, ty, tw, th, m_on ? C(6, 12, 9) : C(4, 3, 8));
+            r->drawRect(tx, ty, tw, th, m_on ? COL_ACC : C(4, 4, 6));
             const s32 ks = th - 6;
             r->drawRect(m_on ? tx + tw - ks - 3 : tx + 3, ty + 3, ks, ks, C(15, 15, 15));
         } else if (!m_value.empty()) {
@@ -672,12 +658,12 @@ private:
     std::vector<u8> m_bmp;
 };
 
-// ---- 小見出し(ピンクの印と、薄い紫の文字) ----
+// ---- 小見出し(灰色の文字と、そのあとに続く細い線) ----
 static tsl::elm::Element *makeHeader(const std::string &text) {
     return new tsl::elm::CustomDrawer([text](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
-        (void)w;
-        r->drawRect(x + 6, y + h - 28, 4, 22, C(14, 5, 13));
-        r->drawString(text.c_str(), false, x + 18, y + h - 10, 18, COL_SUB);
+        s32 tw = textWidth(r, text, 17);
+        r->drawString(text.c_str(), false, x + 6, y + h - 12, 17, COL_SUB);
+        r->drawRect(x + 6 + tw + 12, y + h - 18, w - tw - 24, 1, C(4, 4, 6));
     });
 }
 #define HEADER_H 46
@@ -730,7 +716,10 @@ public:
             (void)h;
             const s32 bx = x + (w - VIEW_W) / 2, by = y + 14;
             r->drawBitmap(bx, by, VIEW_W, VIEW_H, m_bmp.data());
-            rainbowBox(r, bx - 4, by - 4, VIEW_W + 8, VIEW_H + 8, 2, animPhase());
+            r->drawRect(bx - 2, by - 2, VIEW_W + 4, 2, COL_ACC);
+            r->drawRect(bx - 2, by + VIEW_H, VIEW_W + 4, 2, COL_ACC);
+            r->drawRect(bx - 2, by, 2, VIEW_H, COL_ACC);
+            r->drawRect(bx + VIEW_W, by, 2, VIEW_H, COL_ACC);
             r->drawString(sizeLabel(m_m).c_str(), false, bx, by + VIEW_H + 34, 22, COL_TEXT);
             if (m_m.video) r->drawString("※動画の再生は、アプリ版でできます", false, bx, by + VIEW_H + 62, 17, COL_SUB);
         });
@@ -860,7 +849,7 @@ public:
         m_state = sysmoduleState();
         m_note = m_cfg.ok ? "変えると、数秒で反映されます" : "";
 
-        // 状態のカード(虹色の枠)
+        // 状態のカード
         list->addItem(new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) { drawCard(r, x, y, w, h); }), 156);
 
         if (!m_cfg.ok) {
@@ -963,21 +952,21 @@ private:
 
     // 上のカード: 常駐版の状態、いまの送信先、設定のまとめ
     void drawCard(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
-        const s32 cx = x + 2, cy = y + 4, cw = w - 4, ch = h - 12;
-        r->drawRect(cx, cy, cw, ch, C(1, 0, 6, 15));
-        rainbowBox(r, cx, cy, cw, ch, 2, animPhase());
+        const s32 cx = x, cy = y + 4, cw = w, ch = h - 12;
+        r->drawRect(cx, cy, cw, ch, COL_PANEL);
+        for (int i = 0; i < 8; i++) r->drawRect(cx, cy + ch * i / 8, 4, ch / 8 + 1, gradColor(i, 8));  // 左の目印(ピンク→紫)
         if (!m_cfg.ok) {
-            r->drawString("config.txt が読めません", false, cx + 18, cy + 50, 24, COL_BAD);
-            r->drawString("先にアプリで設定してください", false, cx + 18, cy + 86, 18, COL_SUB);
+            r->drawString("config.txt が読めません", false, cx + 22, cy + 50, 24, COL_BAD);
+            r->drawString("先にアプリで設定してください", false, cx + 22, cy + 86, 18, COL_SUB);
             return;
         }
         tsl::Color sc = m_state == 1 ? COL_GOOD : (m_state == 0 ? COL_BAD : COL_WARN);
-        r->drawRect(cx + 18, cy + 18, 10, 10, sc);
-        r->drawString((std::string("常駐版 ") + stateText(m_state)).c_str(), false, cx + 36, cy + 30, 18, sc);
-        r->drawString(m_cfg.hookNames[(size_t)(m_cfg.use - 1)].c_str(), false, cx + 18, cy + 64, 26, COL_TEXT);
+        r->drawRect(cx + 22, cy + 20, 10, 10, sc);
+        r->drawString((std::string("常駐版 ") + stateText(m_state)).c_str(), false, cx + 40, cy + 30, 18, sc);
+        r->drawString(m_cfg.hookNames[(size_t)(m_cfg.use - 1)].c_str(), false, cx + 22, cy + 64, 26, COL_TEXT);
         std::string l3 = std::string("上限 ") + std::to_string(FIXED_LIMIT_MB) + "MB  ・  自動送信 " + onOff(m_cfg.autoSend) + "  ・  通知 " + onOff(m_cfg.notify);
-        r->drawString(l3.c_str(), false, cx + 18, cy + 92, 16, COL_SUB);
-        r->drawString(m_note.c_str(), false, cx + 18, cy + 118, 17, COL_GOOD);
+        r->drawString(l3.c_str(), false, cx + 22, cy + 92, 16, COL_SUB);
+        r->drawString(m_note.c_str(), false, cx + 22, cy + 118, 17, COL_GOOD);
     }
 
     void addToggle(tsl::elm::List *list, const char *label, const char *key, bool *field) {
