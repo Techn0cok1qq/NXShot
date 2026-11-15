@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <csetjmp>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -455,11 +456,66 @@ static void makeThumb(const MediaInfo &m, std::vector<u8> &bmp) {
     }
 }
 
-// ---- 画面の枠(「NXShot」の文字を、アイコンのグラデーションにする) ----
-// 本来の題は空にして、同じ場所に、1文字ずつ色を変えた「NXShot」を重ねて描く。
-// 色は、アイコンの「N」(ピンク→紫)から、右上の丸(青みのある紫)へ
+// ============================================================
+// 見た目(NEXUS風): 濃い紺の地、ピンク〜紫、虹色の線と枠
+// ============================================================
+// Tesla の標準の枠・行は使わず、地・題・行・選んだ行の枠・下の案内を、ここで自分で描く。
+// 画面の大きさは Tesla のオーバーレイ画面(448 x 720)。
+static const s32 FB_W = 448, FB_H = 720;
+
+static tsl::Color C(u8 r, u8 g, u8 b, u8 a = 15) { return tsl::Color(r, g, b, a); }
+
+static const tsl::Color COL_BG    = tsl::Color(1, 0, 4, 15);     // 地: 濃い紺
+static const tsl::Color COL_TEXT  = tsl::Color(15, 15, 15, 15);  // ふつうの文字
+static const tsl::Color COL_SUB   = tsl::Color(11, 10, 15, 15);  // 小さい文字(薄い紫)
+static const tsl::Color COL_VALUE = tsl::Color(6, 14, 15, 15);   // 右側の値(青緑)
+static const tsl::Color COL_GOOD  = tsl::Color(7, 15, 9, 15);
+static const tsl::Color COL_BAD   = tsl::Color(15, 7, 7, 15);
+static const tsl::Color COL_WARN  = tsl::Color(15, 13, 4, 15);
+static const tsl::Color COL_LINE  = tsl::Color(4, 3, 9, 15);     // 行の区切り
+
+// 色相(0〜1)から、少し白を混ぜた明るい色
+static float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+static tsl::Color hueColor(float h) {
+    h -= floorf(h);
+    float r = clamp01(fabsf(h * 6.f - 3.f) - 1.f);
+    float g = clamp01(2.f - fabsf(h * 6.f - 2.f));
+    float b = clamp01(2.f - fabsf(h * 6.f - 4.f));
+    r = 0.2f + 0.8f * r;
+    g = 0.2f + 0.8f * g;
+    b = 0.2f + 0.8f * b;
+    return tsl::Color((u8)(r * 15.f + 0.5f), (u8)(g * 15.f + 0.5f), (u8)(b * 15.f + 0.5f), 15);
+}
+
+// 虹色の流れる速さ(8秒で1周)
+static float animPhase() {
+    u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ULL;
+    return (float)(ms % 8000ULL) / 8000.f;
+}
+
+static void rainbowLine(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 t, float phase) {
+    for (s32 i = 0; i < w; i += 8) {
+        s32 sw = (w - i < 8) ? (w - i) : 8;
+        r->drawRect(x + i, y, sw, t, hueColor(phase + (float)i / (float)w));
+    }
+}
+
+static void rainbowBox(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h, s32 t, float phase) {
+    const float total = (float)(2 * (w + h));
+    for (s32 i = 0; i < w; i += 8) {
+        s32 sw = (w - i < 8) ? (w - i) : 8;
+        r->drawRect(x + i, y, sw, t, hueColor(phase + (float)i / total));                              // 上
+        r->drawRect(x + w - i - sw, y + h - t, sw, t, hueColor(phase + (float)(w + h + i) / total));  // 下
+    }
+    for (s32 j = 0; j < h; j += 8) {
+        s32 sh = (h - j < 8) ? (h - j) : 8;
+        r->drawRect(x + w - t, y + j, t, sh, hueColor(phase + (float)(w + j) / total));                // 右
+        r->drawRect(x, y + h - j - sh, t, sh, hueColor(phase + (float)(2 * w + h + j) / total));      // 左
+    }
+}
+
+// 題の色: アイコンの「N」(ピンク→紫)から、右上の丸(青みのある紫)へ
 static tsl::Color gradColor(int i, int n) {
-    // 色の目印(RGB各16段階): ピンク → 紫 → 青紫
     static const float S[3][3] = {{13.f, 5.f, 9.f}, {10.f, 6.f, 13.f}, {7.f, 7.f, 14.f}};
     float t = (n > 1) ? (float)i / (float)(n - 1) : 0.f;
     int a = t < 0.5f ? 0 : 1;
@@ -472,44 +528,142 @@ static tsl::Color gradColor(int i, int n) {
     return tsl::Color(c[0], c[1], c[2], 15);
 }
 
+// 「NXShot」を、必ず1度に描く(1文字ずつだと文字の幅の取り方で重なることがあった)。
+// 色の変化は、縦に細く切った帯ごとに、描く範囲を絞って(scissor)つける。
+static void drawTitle(tsl::gfx::Renderer *r) {
+    const char *TITLE = "NXShot";
+    const s32 X0 = 20, Y = 50, SZ = 34;
+    auto dim = r->drawString(TITLE, false, X0, Y, SZ, tsl::Color(0, 0, 0, 0));  // 透明で描いて、幅を測る
+    s32 W = (s32)dim.first;
+    if (W < 80 || W > 240) W = 130;
+    const int BANDS = 12;
+    for (int i = 0; i < BANDS; i++) {
+        s32 x0 = X0 + W * i / BANDS;
+        s32 x1 = (i == BANDS - 1) ? X0 + W + 40 : X0 + W * (i + 1) / BANDS;
+        r->enableScissoring(x0, 8, x1 - x0, 62);
+        r->drawString(TITLE, false, X0, Y, SZ, gradColor(i, BANDS));
+    }
+    r->disableScissoring();
+}
+
+// ---- 画面の枠(地・題・虹色の線・下の案内を自分で描く) ----
 class NXFrame : public tsl::elm::OverlayFrame {
 public:
-    explicit NXFrame(const std::string &subtitle) : tsl::elm::OverlayFrame("", subtitle) {}
+    explicit NXFrame(const std::string &subtitle) : tsl::elm::OverlayFrame("", subtitle), m_sub(subtitle) {}
 
-    void draw(tsl::gfx::Renderer *renderer) override {
-        tsl::elm::OverlayFrame::draw(renderer);
-        // 1文字ずつ描くと、文字の幅の取り方によっては N X S が重なって崩れる。
-        // なので「NXShot」は必ず1度に(文字の間隔は、ふつうの文字と同じに)描き、
-        // 色の変化は、縦に細く切った帯ごとに、画面の描く範囲を絞って(scissor)つける。
-        const char *TITLE = "NXShot";
-        const s32 X0 = 20, Y = 50, SZ = 32;
-        // いちど透明で描いて、文字の形を準備しつつ、幅を測る(測れなかったときは、標準の幅を使う)
-        auto dim = renderer->drawString(TITLE, false, X0, Y, SZ, tsl::Color(0, 0, 0, 0));
-        s32 W = (s32)dim.first;
-        if (W < 80 || W > 220) W = 125;
-        const int BANDS = 12;
-        for (int i = 0; i < BANDS; i++) {
-            s32 x0 = X0 + W * i / BANDS;
-            s32 x1 = (i == BANDS - 1) ? X0 + W + 40 : X0 + W * (i + 1) / BANDS;
-            renderer->enableScissoring(x0, 10, x1 - x0, 62);
-            renderer->drawString(TITLE, false, X0, Y, SZ, gradColor(i, BANDS));
+    // setContent の代わりに使う(中身の持ち主は、これまでどおり枠)
+    void setNXContent(tsl::elm::Element *e) {
+        m_nx = e;
+        setContent(e);
+    }
+
+    void draw(tsl::gfx::Renderer *r) override {
+        r->fillScreen(COL_BG);
+        r->drawRect(FB_W - 1, 0, 1, FB_H, C(8, 4, 15));
+        drawTitle(r);
+        r->drawString(m_sub.c_str(), false, 21, 74, 16, COL_SUB);
+        rainbowLine(r, 12, 90, FB_W - 24, 2, animPhase());
+        if (m_nx) m_nx->frame(r);
+        // 下の案内(中身が下にはみ出しても隠れるよう、あとから描く)
+        r->drawRect(0, FB_H - 74, FB_W, 74, COL_BG);
+        r->drawRect(15, FB_H - 73, FB_W - 30, 1, C(9, 5, 14));
+        r->drawString("\uE0E1  戻る", false, 30, 693, 23, C(15, 12, 15));
+        r->drawString("\uE0E0  OK", false, 200, 693, 23, C(15, 12, 15));
+    }
+
+    // 中身を、題のすぐ下(虹色の線のあと)から始める
+    void layout(u16 px, u16 py, u16 pw, u16 ph) {
+        tsl::elm::OverlayFrame::layout(px, py, pw, ph);
+        if (m_nx) {
+            m_nx->setBoundaries(px + 25, py + 100, pw - 60, ph - 100 - 76);
+            m_nx->invalidate();
         }
-        renderer->disableScissoring();
+    }
+
+private:
+    std::string m_sub;
+    tsl::elm::Element *m_nx = nullptr;
+};
+
+// ---- 行の土台: 選んでいる行は、紫で塗って、ピンクの枠を付ける ----
+class NXItem : public tsl::elm::ListItem {
+public:
+    NXItem() : tsl::elm::ListItem("") {}
+
+    // Tesla が、選んでいる行の「下地」と「枠」を描くときに呼ぶ(標準の見た目の代わり)
+    void drawFocusBackground(tsl::gfx::Renderer *r) { r->drawRect(getX(), getY(), getWidth(), getHeight(), C(5, 1, 11, 12)); }
+    void drawHighlight(tsl::gfx::Renderer *r) {
+        const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
+        tsl::Color c = C(14, 4, 14, 15);
+        r->drawRect(x, y, w, 2, c);
+        r->drawRect(x, y + h - 2, w, 2, c);
+        r->drawRect(x, y, 2, h, c);
+        r->drawRect(x + w - 2, y, 2, h, c);
     }
 };
 
-// ---- 直近の写真・動画の1行(左に時刻と大きさ、右にサムネ) ----
-class MediaItem : public tsl::elm::ListItem {
+// 文字の幅(透明で描いて測る。測れなかったときは、文字数からの見積もり)
+static s32 textWidth(tsl::gfx::Renderer *r, const std::string &s, s32 size) {
+    if (s.empty()) return 0;
+    auto d = r->drawString(s.c_str(), false, 0, 0, size, tsl::Color(0, 0, 0, 0));
+    s32 w = (s32)d.first;
+    if (w <= 0 || w > 600) w = (s32)s.size() * size / 2;
+    return w;
+}
+
+// ---- 設定の1行: 左に名前、右に値(または、スイッチ) ----
+class NXRow : public NXItem {
 public:
-    MediaItem(const std::string &time, const std::string &sub, bool warn, std::vector<u8> bmp)
-        : tsl::elm::ListItem(""), m_time(time), m_sub(sub), m_warn(warn), m_bmp(std::move(bmp)) {}
+    explicit NXRow(const std::string &label) : m_label(label) {}
+
+    void setValue(const std::string &v) { m_value = v; }
+
+    // スイッチの行にする(A で切り替わる。変わったら cb を呼ぶ)
+    void setToggle(bool on, std::function<void(bool)> cb) {
+        m_toggle = true;
+        m_on = on;
+        m_cb = std::move(cb);
+        setClickListener([this](u64 keys) {
+            if (!(keys & HidNpadButton_A)) return false;
+            m_on = !m_on;
+            if (m_cb) m_cb(m_on);
+            return true;
+        });
+    }
 
     void draw(tsl::gfx::Renderer *r) override {
         const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
-        r->drawString(m_time.c_str(), false, x + 16, y + h * 43 / 100, 22, tsl::Color(15, 15, 15, 15));
-        r->drawString(m_sub.c_str(), false, x + 16, y + h * 78 / 100, 17, m_warn ? tsl::Color(15, 12, 4, 15) : tsl::Color(10, 10, 10, 15));
+        r->drawString(m_label.c_str(), false, x + 16, y + h * 62 / 100, 22, COL_TEXT);
+        if (m_toggle) {
+            const s32 tw = 50, th = 24, tx = x + w - 16 - tw, ty = y + (h - th) / 2;
+            r->drawRect(tx, ty, tw, th, m_on ? C(6, 12, 9) : C(4, 3, 8));
+            const s32 ks = th - 6;
+            r->drawRect(m_on ? tx + tw - ks - 3 : tx + 3, ty + 3, ks, ks, C(15, 15, 15));
+        } else if (!m_value.empty()) {
+            s32 vw = textWidth(r, m_value, 20);
+            r->drawString(m_value.c_str(), false, x + w - 16 - vw, y + h * 62 / 100, 20, COL_VALUE);
+        }
+        r->drawRect(x + 8, y + h - 1, w - 16, 1, COL_LINE);
+    }
+
+private:
+    std::string m_label, m_value;
+    bool m_toggle = false, m_on = false;
+    std::function<void(bool)> m_cb;
+};
+
+// ---- 直近の写真・動画の1行(左に時刻と大きさ、右にサムネ) ----
+class MediaItem : public NXItem {
+public:
+    MediaItem(const std::string &time, const std::string &sub, bool warn, std::vector<u8> bmp)
+        : m_time(time), m_sub(sub), m_warn(warn), m_bmp(std::move(bmp)) {}
+
+    void draw(tsl::gfx::Renderer *r) override {
+        const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
+        r->drawString(m_time.c_str(), false, x + 16, y + h * 43 / 100, 22, COL_TEXT);
+        r->drawString(m_sub.c_str(), false, x + 16, y + h * 78 / 100, 17, m_warn ? COL_WARN : COL_SUB);
         if (!m_bmp.empty()) r->drawBitmap(x + w - THUMB_W - 12, y + (h - THUMB_H) / 2, THUMB_W, THUMB_H, m_bmp.data());
-        r->drawRect(x, y + h - 1, w, 1, tsl::Color(5, 5, 5, 15));
+        r->drawRect(x + 8, y + h - 1, w - 16, 1, COL_LINE);
     }
 
 private:
@@ -517,6 +671,16 @@ private:
     bool m_warn;
     std::vector<u8> m_bmp;
 };
+
+// ---- 小見出し(ピンクの印と、薄い紫の文字) ----
+static tsl::elm::Element *makeHeader(const std::string &text) {
+    return new tsl::elm::CustomDrawer([text](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+        (void)w;
+        r->drawRect(x + 6, y + h - 28, 4, 22, C(14, 5, 13));
+        r->drawString(text.c_str(), false, x + 18, y + h - 10, 18, COL_SUB);
+    });
+}
+#define HEADER_H 46
 
 // ---- 送る依頼(常駐版 1.3.3 以降が、ovl_send.txt を読んで送る) ----
 static bool requestSend(const std::string &path) {
@@ -549,7 +713,7 @@ static int readSendResult() {
 
 // ---- 1件を大きく見て、送る画面 ----
 // 写真: 大きく表示。動画: 中の絵(あれば)を表示。動画の再生は、オーバーレイでは(メモリの都合で)できない。
-// 「送る」は、設定画面のスイッチと同じ、押せる行(ListItem)にしてある(A で送る、B で戻る)。
+// 「送る」は、押せる行(A で送る、B で戻る)。
 class ViewGui : public tsl::Gui {
 public:
     explicit ViewGui(MediaInfo m) : m_m(std::move(m)) {}
@@ -564,22 +728,23 @@ public:
         }
         auto *pane = new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
             (void)h;
-            const s32 bx = x + (w - VIEW_W) / 2;
-            r->drawBitmap(bx, y + 10, VIEW_W, VIEW_H, m_bmp.data());
-            r->drawString(sizeLabel(m_m).c_str(), false, bx, y + 10 + VIEW_H + 30, 22, tsl::Color(15, 15, 15, 15));
-            if (m_m.video) r->drawString("※動画の再生は、アプリ版でできます", false, bx, y + 10 + VIEW_H + 58, 17, tsl::Color(10, 10, 10, 15));
+            const s32 bx = x + (w - VIEW_W) / 2, by = y + 14;
+            r->drawBitmap(bx, by, VIEW_W, VIEW_H, m_bmp.data());
+            rainbowBox(r, bx - 4, by - 4, VIEW_W + 8, VIEW_H + 8, 2, animPhase());
+            r->drawString(sizeLabel(m_m).c_str(), false, bx, by + VIEW_H + 34, 22, COL_TEXT);
+            if (m_m.video) r->drawString("※動画の再生は、アプリ版でできます", false, bx, by + VIEW_H + 62, 17, COL_SUB);
         });
-        list->addItem(pane, VIEW_H + 76);
+        list->addItem(pane, VIEW_H + 90);
 
-        m_send = new tsl::elm::ListItem("Discordへ送る  Aで送る");
-        m_send->setValue("");
+        m_send = new NXRow("Discordへ送る");
+        m_send->setValue("A");
         m_send->setClickListener([this](u64 keys) {
             if (!(keys & HidNpadButton_A)) return false;
             startSend();
             return true;
         });
         list->addItem(m_send);
-        frame->setContent(list);
+        frame->setNXContent(list);
         return frame;
     }
 
@@ -617,7 +782,7 @@ public:
 private:
     MediaInfo m_m;
     std::vector<u8> m_bmp;
-    tsl::elm::ListItem *m_send = nullptr;
+    NXRow *m_send = nullptr;
     bool m_pending = false;
     u64 m_since = 0;
 
@@ -649,12 +814,15 @@ public:
     tsl::elm::Element *createUI() override {
         auto *frame = new NXFrame("直近の写真・動画");
         auto *list = new tsl::elm::List();
-        list->addItem(new tsl::elm::CategoryHeader("新しい順(最大" + std::to_string(RECENT_COUNT) + "件)  Aで開く"));
+        list->addItem(makeHeader("新しい順(最大" + std::to_string(RECENT_COUNT) + "件)  Aで開く"), HEADER_H);
         std::vector<MediaInfo> v = recentMedia(m_album, RECENT_COUNT);
         if (v.empty()) {
-            auto *none = new tsl::elm::ListItem("見つかりません");
-            none->setValue("アルバムが空か、場所が違います");
-            list->addItem(none);
+            list->addItem(new tsl::elm::CustomDrawer([](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+                (void)w;
+                (void)h;
+                r->drawString("見つかりません", false, x + 16, y + 34, 22, COL_TEXT);
+                r->drawString("アルバムが空か、場所が違います", false, x + 16, y + 64, 17, COL_SUB);
+            }), 90);
         }
         for (auto &m : v) {
             std::vector<u8> bmp;
@@ -669,7 +837,7 @@ public:
             });
             list->addItem(item);
         }
-        frame->setContent(list);
+        frame->setNXContent(list);
         return frame;
     }
 
@@ -689,29 +857,21 @@ public:
         loadCfg(m_cfg);
         // 送る上限は20MBに固定: ちがう値なら、開いたときにそろえる
         if (m_cfg.ok && m_cfg.limitMB != FIXED_LIMIT_MB && setKey("limit", std::to_string(FIXED_LIMIT_MB))) m_cfg.limitMB = FIXED_LIMIT_MB;
+        m_state = sysmoduleState();
+        m_note = m_cfg.ok ? "変えると、数秒で反映されます" : "";
 
-        // 状態
-        list->addItem(new tsl::elm::CategoryHeader("状態"));
-        m_status = new tsl::elm::ListItem("常駐版");
-        m_status->setValue(stateText(sysmoduleState()));
-        list->addItem(m_status);
+        // 状態のカード(虹色の枠)
+        list->addItem(new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) { drawCard(r, x, y, w, h); }), 156);
 
         if (!m_cfg.ok) {
-            auto *err = new tsl::elm::ListItem("config.txt が読めません");
-            err->setValue("先にアプリで設定");
-            list->addItem(err);
-            frame->setContent(list);
+            frame->setNXContent(list);
             return frame;
         }
 
-        m_msg = new tsl::elm::ListItem("保存");
-        m_msg->setValue("変えると、数秒で反映");
-        list->addItem(m_msg);
-
-        // 直近の写真・動画
-        list->addItem(new tsl::elm::CategoryHeader("アルバム"));
-        auto *recent = new tsl::elm::ListItem("直近の写真・動画  Aで開く");
-        recent->setValue(std::to_string(RECENT_COUNT) + "件");
+        // アルバム
+        list->addItem(makeHeader("アルバム"), HEADER_H);
+        auto *recent = new NXRow("直近の写真・動画");
+        recent->setValue(std::to_string(RECENT_COUNT) + "件  >");
         std::string album = m_cfg.album;
         recent->setClickListener([album](u64 keys) {
             if (!(keys & HidNpadButton_A)) return false;
@@ -721,14 +881,14 @@ public:
         list->addItem(recent);
 
         // 送る・通知
-        list->addItem(new tsl::elm::CategoryHeader("送る・通知"));
-        addToggle(list, "写真・動画の自動送信", "auto", m_cfg.autoSend);
-        addToggle(list, "ゲームの開始・終了の通知", "notify", m_cfg.notify);
+        list->addItem(makeHeader("送る・通知"), HEADER_H);
+        addToggle(list, "写真・動画の自動送信", "auto", &m_cfg.autoSend);
+        addToggle(list, "ゲームの開始・終了の通知", "notify", &m_cfg.notify);
 
         // 送信先
         if (m_cfg.hookNames.size() > 1) {
-            list->addItem(new tsl::elm::CategoryHeader("送信先"));
-            m_hook = new tsl::elm::ListItem("いまの送信先");
+            list->addItem(makeHeader("送信先"), HEADER_H);
+            m_hook = new NXRow("いまの送信先");
             m_hook->setValue(m_cfg.hookNames[(size_t)(m_cfg.use - 1)]);
             m_hook->setClickListener([this](u64 keys) {
                 if (!(keys & HidNpadButton_A)) return false;
@@ -747,14 +907,14 @@ public:
         }
 
         // 動画・見た目
-        list->addItem(new tsl::elm::CategoryHeader("動画・見た目"));
-        auto *lim = new tsl::elm::ListItem("送る上限");
+        list->addItem(makeHeader("動画・見た目"), HEADER_H);
+        auto *lim = new NXRow("送る上限");
         lim->setValue(std::to_string(FIXED_LIMIT_MB) + " MB(固定)");
         list->addItem(lim);
 
-        addToggle(list, "大きい動画を削って送る", "trim", m_cfg.trim);
+        addToggle(list, "大きい動画を削って送る", "trim", &m_cfg.trim);
 
-        m_icon = new tsl::elm::ListItem("ゲームのアイコン  Aで切替");
+        m_icon = new NXRow("ゲームのアイコン  Aで切替");
         m_icon->setValue(iconText(m_cfg.icon));
         m_icon->setClickListener([this](u64 keys) {
             if (!(keys & HidNpadButton_A)) return false;
@@ -770,40 +930,63 @@ public:
         });
         list->addItem(m_icon);
 
-        addToggle(list, "通知の下に NXShot を出す", "footer", m_cfg.footer);
+        addToggle(list, "通知の下に NXShot を出す", "footer", &m_cfg.footer);
 
-        frame->setContent(list);
+        frame->setNXContent(list);
         return frame;
     }
 
     void update() override {
         // 2秒ごとに、常駐版の状態を確かめ直す
         u64 now = armGetSystemTick();
-        if (m_status && now - m_lastTick > armNsToTicks(2000000000ULL)) {
+        if (now - m_lastTick > armNsToTicks(2000000000ULL)) {
             m_lastTick = now;
-            m_status->setValue(stateText(sysmoduleState()));
+            m_state = sysmoduleState();
         }
     }
 
 private:
     Cfg m_cfg;
-    tsl::elm::ListItem *m_status = nullptr, *m_msg = nullptr, *m_hook = nullptr, *m_icon = nullptr;
+    NXRow *m_hook = nullptr, *m_icon = nullptr;
     u64 m_lastTick = 0;
+    int m_state = -1;
+    std::string m_note;
 
     static const char *iconText(int i) {
         static const char *N[] = {"なし", "左上", "右上", "フッター"};
         return (i >= 0 && i <= 3) ? N[i] : "左上";
     }
 
-    void say(const char *s) {
-        if (m_msg) m_msg->setValue(s);
+    static const char *onOff(bool b) { return b ? "オン" : "オフ"; }
+
+    void say(const char *s) { m_note = s; }
+
+    // 上のカード: 常駐版の状態、いまの送信先、設定のまとめ
+    void drawCard(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+        const s32 cx = x + 2, cy = y + 4, cw = w - 4, ch = h - 12;
+        r->drawRect(cx, cy, cw, ch, C(1, 0, 6, 15));
+        rainbowBox(r, cx, cy, cw, ch, 2, animPhase());
+        if (!m_cfg.ok) {
+            r->drawString("config.txt が読めません", false, cx + 18, cy + 50, 24, COL_BAD);
+            r->drawString("先にアプリで設定してください", false, cx + 18, cy + 86, 18, COL_SUB);
+            return;
+        }
+        tsl::Color sc = m_state == 1 ? COL_GOOD : (m_state == 0 ? COL_BAD : COL_WARN);
+        r->drawRect(cx + 18, cy + 18, 10, 10, sc);
+        r->drawString((std::string("常駐版 ") + stateText(m_state)).c_str(), false, cx + 36, cy + 30, 18, sc);
+        r->drawString(m_cfg.hookNames[(size_t)(m_cfg.use - 1)].c_str(), false, cx + 18, cy + 64, 26, COL_TEXT);
+        std::string l3 = std::string("上限 ") + std::to_string(FIXED_LIMIT_MB) + "MB  ・  自動送信 " + onOff(m_cfg.autoSend) + "  ・  通知 " + onOff(m_cfg.notify);
+        r->drawString(l3.c_str(), false, cx + 18, cy + 92, 16, COL_SUB);
+        r->drawString(m_note.c_str(), false, cx + 18, cy + 118, 17, COL_GOOD);
     }
 
-    void addToggle(tsl::elm::List *list, const char *label, const char *key, bool initial) {
-        auto *t = new tsl::elm::ToggleListItem(label, initial);
+    void addToggle(tsl::elm::List *list, const char *label, const char *key, bool *field) {
+        auto *t = new NXRow(label);
         std::string k(key);
-        t->setStateChangedListener([this, k](bool on) {
-            say(setKey(k.c_str(), on ? "1" : "0") ? "保存しました" : "保存できませんでした");
+        t->setToggle(*field, [this, k, field](bool on) {
+            bool ok = setKey(k.c_str(), on ? "1" : "0");
+            if (ok) *field = on;
+            say(ok ? "保存しました" : "保存できませんでした");
         });
         list->addItem(t);
     }
