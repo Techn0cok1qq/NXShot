@@ -464,6 +464,12 @@ static void makeThumb(const MediaInfo &m, std::vector<u8> &bmp) {
 // 画面の大きさは Tesla のオーバーレイ画面(448 x 720)。
 static const s32 FB_W = 448, FB_H = 720;
 
+// 中身(リスト)が見える範囲。枠が、並べるときに決める。
+// 行は、この範囲に「まるごと入っているとき」だけ描く(はみ出す行は描かない)。
+// こうすると、上や下を地で塗り直さなくて済む(大きな四角を毎フレーム塗るのは、とても重い)。
+static s32 g_listTop = 100, g_listBottom = 644;
+static bool inView(s32 y, s32 h) { return y >= g_listTop - 2 && y + h <= g_listBottom + 2; }
+
 static tsl::Color C(u8 r, u8 g, u8 b, u8 a = 15) { return tsl::Color(r, g, b, a); }
 
 static const tsl::Color COL_BG    = tsl::Color(1, 1, 2, 15);     // 地: ほぼ黒(ほんの少しだけ青)
@@ -551,25 +557,33 @@ public:
         setContent(e);
     }
 
+    // 上に固定して(スクロールしても動かない)描くもの。リストの上に置く
+    void setPin(s32 h, std::function<void(tsl::gfx::Renderer *, s32, s32, s32, s32)> fn) {
+        m_pinH = h;
+        m_pin = std::move(fn);
+    }
+
     void draw(tsl::gfx::Renderer *r) override {
-        r->fillScreen(COL_BG);
+        r->fillScreen(COL_BG);  // これは速い(画面全体を一気に塗る)。大きな四角は、これ以外では塗らない
         if (m_nx) m_nx->frame(r);
-        // 上と下は、中身のあとに描く(開いた直後などに、中身が上や下にはみ出しても、隠れるように)
-        r->drawRect(0, 0, FB_W, 97, COL_BG);
+        if (m_pin) m_pin(r, 25, 100, 388, m_pinH);
         drawTitle(r);
         r->drawString(m_sub.c_str(), false, 21, 74, 16, COL_SUB);
         rainbowLine(r, 20, 88, FB_W - 40, 2);
-        r->drawRect(0, FB_H - 74, FB_W, 74, COL_BG);
         r->drawRect(20, FB_H - 73, FB_W - 40, 1, C(5, 5, 7));
         r->drawString("\uE0E1  戻る", false, 30, 693, 22, COL_SUB);
         r->drawString("\uE0E0  OK", false, 200, 693, 22, COL_SUB);
     }
 
-    // 中身を、題のすぐ下(虹色の線のあと)から始める
+    // 中身を、題のすぐ下(虹色の線のあと)から始める(固定のカードがあれば、その下から)
     void layout(u16 px, u16 py, u16 pw, u16 ph) {
         tsl::elm::OverlayFrame::layout(px, py, pw, ph);
         if (m_nx) {
-            m_nx->setBoundaries(px + 25, py + 100, pw - 60, ph - 100 - 76);
+            const s32 top = (s32)py + 100 + m_pinH;
+            const s32 h = (s32)ph - 100 - m_pinH - 76;
+            g_listTop = top;
+            g_listBottom = top + h;
+            m_nx->setBoundaries(px + 25, top, pw - 60, h);
             m_nx->invalidate();
         }
     }
@@ -577,6 +591,8 @@ public:
 private:
     std::string m_sub;
     tsl::elm::Element *m_nx = nullptr;
+    s32 m_pinH = 0;
+    std::function<void(tsl::gfx::Renderer *, s32, s32, s32, s32)> m_pin;
 };
 
 // ---- 行の土台: 選んでいる行は、薄い地を敷いて、左に太い目印を付ける ----
@@ -585,8 +601,14 @@ public:
     NXItem() : tsl::elm::ListItem("") {}
 
     // Tesla が、選んでいる行の「下地」と「枠」を描くときに呼ぶ(標準の見た目の代わり)
-    void drawFocusBackground(tsl::gfx::Renderer *r) { r->drawRect(getX(), getY(), getWidth(), getHeight(), C(4, 4, 6, 15)); }
-    void drawHighlight(tsl::gfx::Renderer *r) { r->drawRect(getX(), getY() + 4, 4, getHeight() - 8, COL_ACC); }
+    void drawFocusBackground(tsl::gfx::Renderer *r) {
+        if (!inView(getY(), getHeight())) return;
+        r->drawRect(getX(), getY(), getWidth(), getHeight(), C(4, 4, 6, 15));
+    }
+    void drawHighlight(tsl::gfx::Renderer *r) {
+        if (!inView(getY(), getHeight())) return;
+        r->drawRect(getX(), getY() + 4, 4, getHeight() - 8, COL_ACC);
+    }
 };
 
 // 文字の幅(透明で描いて測る。測れなかったときは、文字数からの見積もり)
@@ -623,6 +645,7 @@ public:
 
     void draw(tsl::gfx::Renderer *r) override {
         const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
+        if (!inView(y, h)) return;
         r->drawString(m_label.c_str(), false, x + 18, y + h * 62 / 100, 22, COL_TEXT);
         if (m_toggle) {
             const s32 tw = 50, th = 24, tx = x + w - 16 - tw, ty = y + (h - th) / 2;
@@ -652,6 +675,7 @@ public:
 
     void draw(tsl::gfx::Renderer *r) override {
         const s32 x = getX(), y = getY(), w = getWidth(), h = getHeight();
+        if (!inView(y, h)) return;
         r->drawString(m_time.c_str(), false, x + 16, y + h * 43 / 100, 22, COL_TEXT);
         r->drawString(m_sub.c_str(), false, x + 16, y + h * 78 / 100, 17, m_warn ? COL_WARN : COL_SUB);
         if (!m_bmp.empty()) r->drawBitmap(x + w - THUMB_W - 12, y + (h - THUMB_H) / 2, THUMB_W, THUMB_H, m_bmp.data());
@@ -668,6 +692,7 @@ private:
 static tsl::elm::Element *makeHeader(const std::string &text) {
     auto tw = std::make_shared<s32>(-1);  // 文字の幅は、最初に描くときに1回だけ測る
     return new tsl::elm::CustomDrawer([text, tw](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+        if (!inView(y, h)) return;
         if (*tw < 0) *tw = textWidth(r, text, 17);
         r->drawString(text.c_str(), false, x + 6, y + h - 12, 17, COL_SUB);
         r->drawRect(x + 6 + *tw + 12, y + h - 18, w - *tw - 24, 1, C(4, 4, 6));
@@ -855,9 +880,11 @@ public:
         if (m_cfg.ok && m_cfg.limitMB != FIXED_LIMIT_MB && setKey("limit", std::to_string(FIXED_LIMIT_MB))) m_cfg.limitMB = FIXED_LIMIT_MB;
         m_state = sysmoduleState();
         m_note = m_cfg.ok ? "変えると、数秒で反映されます" : "";
+        refreshCard();
 
-        // 状態のカード
-        list->addItem(new tsl::elm::CustomDrawer([this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) { drawCard(r, x, y, w, h); }), 156);
+        // 状態のカードは、リストに入れず、上に固定する
+        // (リストに入れると、Teslaが「選んだ行を上から3分の1に置く」ために、カードごと上へずらしてしまう)
+        frame->setPin(156, [this](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) { drawCard(r, x, y, w, h); });
 
         if (!m_cfg.ok) {
             frame->setNXContent(list);
@@ -937,7 +964,11 @@ public:
         u64 now = armGetSystemTick();
         if (now - m_lastTick > armNsToTicks(2000000000ULL)) {
             m_lastTick = now;
-            m_state = sysmoduleState();
+            int st = sysmoduleState();
+            if (st != m_state) {
+                m_state = st;
+                refreshCard();
+            }
         }
     }
 
@@ -946,7 +977,7 @@ private:
     NXRow *m_hook = nullptr, *m_icon = nullptr;
     u64 m_lastTick = 0;
     int m_state = -1;
-    std::string m_note;
+    std::string m_note, m_cardState, m_cardLine3;  // カードに出す文字(変わったときだけ作り直す)
 
     static const char *iconText(int i) {
         static const char *N[] = {"なし", "左上", "右上", "フッター"};
@@ -956,6 +987,11 @@ private:
     static const char *onOff(bool b) { return b ? "オン" : "オフ"; }
 
     void say(const char *s) { m_note = s; }
+
+    void refreshCard() {
+        m_cardState = std::string("常駐版 ") + stateText(m_state);
+        m_cardLine3 = std::string("上限 ") + std::to_string(FIXED_LIMIT_MB) + "MB  ・  自動送信 " + onOff(m_cfg.autoSend) + "  ・  通知 " + onOff(m_cfg.notify);
+    }
 
     // 上のカード: 常駐版の状態、いまの送信先、設定のまとめ
     void drawCard(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
@@ -969,10 +1005,9 @@ private:
         }
         tsl::Color sc = m_state == 1 ? COL_GOOD : (m_state == 0 ? COL_BAD : COL_WARN);
         r->drawRect(cx + 22, cy + 20, 10, 10, sc);
-        r->drawString((std::string("常駐版 ") + stateText(m_state)).c_str(), false, cx + 40, cy + 30, 18, sc);
+        r->drawString(m_cardState.c_str(), false, cx + 40, cy + 30, 18, sc);
         r->drawString(m_cfg.hookNames[(size_t)(m_cfg.use - 1)].c_str(), false, cx + 22, cy + 64, 26, COL_TEXT);
-        std::string l3 = std::string("上限 ") + std::to_string(FIXED_LIMIT_MB) + "MB  ・  自動送信 " + onOff(m_cfg.autoSend) + "  ・  通知 " + onOff(m_cfg.notify);
-        r->drawString(l3.c_str(), false, cx + 22, cy + 92, 16, COL_SUB);
+        r->drawString(m_cardLine3.c_str(), false, cx + 22, cy + 92, 16, COL_SUB);
         r->drawString(m_note.c_str(), false, cx + 22, cy + 118, 17, COL_GOOD);
     }
 
@@ -981,7 +1016,10 @@ private:
         std::string k(key);
         t->setToggle(*field, [this, k, field](bool on) {
             bool ok = setKey(k.c_str(), on ? "1" : "0");
-            if (ok) *field = on;
+            if (ok) {
+                *field = on;
+                refreshCard();
+            }
             say(ok ? "保存しました" : "保存できませんでした");
         });
         list->addItem(t);
