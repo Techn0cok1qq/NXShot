@@ -1,3 +1,10 @@
+<p align="center">
+  <img src="NXShot.png" width="220" alt="MXShot アプリアイコン">
+</p>
+
+<h1 align="center">NXShot</h1>
+
+
 <img src="NXShot.png" width="200">
 
 # NXShot 1.3.3
