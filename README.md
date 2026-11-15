@@ -4,8 +4,6 @@
 
 <h1 align="center">NXShot1.3.3</h1>
 
-# NXShot 1.3.3
-
 Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)です。
 **Switch単体で**、ゲームの開始・終了と、撮ったスクリーンショットや動画をDiscordのWebhookへ送ります。PCは要りません。
 
