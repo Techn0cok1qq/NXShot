@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -490,15 +491,6 @@ static tsl::Color gradColor(int i, int n) {
     return tsl::Color(c[0], c[1], c[2], 15);
 }
 
-// ピンク→紫の横線(静止)
-static void gradLine(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 t) {
-    const int N = 24;
-    for (int i = 0; i < N; i++) {
-        s32 x0 = x + w * i / N, x1 = x + w * (i + 1) / N;
-        r->drawRect(x0, y, x1 - x0, t, gradColor(i, N));
-    }
-}
-
 // 虹色の線(題の下)。色相から、少し白を混ぜた明るい色にして、8秒で1周ゆっくり流す
 static float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 static tsl::Color hueColor(float h) {
@@ -515,29 +507,37 @@ static tsl::Color hueColor(float h) {
 static void rainbowLine(tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 t) {
     u64 ms = armTicksToNs(armGetSystemTick()) / 1000000ULL;
     float phase = (float)(ms % 8000ULL) / 8000.f;
-    for (s32 i = 0; i < w; i += 8) {
-        s32 sw = (w - i < 8) ? (w - i) : 8;
+    for (s32 i = 0; i < w; i += 16) {
+        s32 sw = (w - i < 16) ? (w - i) : 16;
         r->drawRect(x + i, y, sw, t, hueColor(phase + (float)i / (float)w));
     }
 }
 
-// 「NXShot」を、必ず1度に描く(1文字ずつだと文字の幅の取り方で重なることがあった)。
-// 色の変化は、縦に細く切った帯ごとに、描く範囲を絞って(scissor)つける。
-// ※ scissor は「入れたら、必ずその場で出す」(入れっぱなしにすると、あとの描画が切り取られる)
+// 題「NXShot」を、1文字ずつ色を変えて描く(毎フレーム呼ばれるので、軽くする)。
+// 文字の位置は、最初の1回だけ「ここまでの幅」を測って覚える。
+// 測った幅が、おかしいとき(重なるほど小さい、など)は、決め打ちの幅を使う(文字が重ならないように)。
 static void drawTitle(tsl::gfx::Renderer *r) {
-    const char *TITLE = "NXShot";
+    static const char *L[6] = {"N", "X", "S", "h", "o", "t"};
+    static const char *PRE[6] = {"", "N", "NX", "NXS", "NXSh", "NXSho"};
+    static s32 px[6];
+    static bool ready = false;
     const s32 X0 = 20, Y = 50, SZ = 34;
-    auto dim = r->drawString(TITLE, false, X0, Y, SZ, tsl::Color(0, 0, 0, 0));  // 透明で描いて、幅を測る
-    s32 W = (s32)dim.first;
-    if (W < 80 || W > 240) W = 130;
-    const int BANDS = 12;
-    for (int i = 0; i < BANDS; i++) {
-        s32 x0 = X0 + W * i / BANDS;
-        s32 x1 = (i == BANDS - 1) ? X0 + W + 40 : X0 + W * (i + 1) / BANDS;
-        r->enableScissoring(x0, 8, x1 - x0, 62);
-        r->drawString(TITLE, false, X0, Y, SZ, gradColor(i, BANDS));
-        r->disableScissoring();
+    if (!ready) {
+        s32 w[6] = {0, 0, 0, 0, 0, 0};
+        bool ok = true;
+        for (int i = 1; i < 6; i++) {
+            auto d = r->drawString(PRE[i], false, 0, 0, SZ, tsl::Color(0, 0, 0, 0));  // 透明で描いて、幅を測る
+            w[i] = (s32)d.first;
+            if (w[i] - w[i - 1] < 8 || w[i] - w[i - 1] > 40) ok = false;
+        }
+        if (!ok) {
+            static const s32 FB[6] = {0, 25, 48, 69, 88, 107};
+            for (int i = 0; i < 6; i++) w[i] = FB[i];
+        }
+        for (int i = 0; i < 6; i++) px[i] = X0 + w[i];
+        ready = true;
     }
+    for (int i = 0; i < 6; i++) r->drawString(L[i], false, px[i], Y, SZ, gradColor(i, 6));
 }
 
 // ---- 画面の枠(地・題・虹色の線・下の案内を自分で描く) ----
@@ -553,11 +553,12 @@ public:
 
     void draw(tsl::gfx::Renderer *r) override {
         r->fillScreen(COL_BG);
+        if (m_nx) m_nx->frame(r);
+        // 上と下は、中身のあとに描く(開いた直後などに、中身が上や下にはみ出しても、隠れるように)
+        r->drawRect(0, 0, FB_W, 97, COL_BG);
         drawTitle(r);
         r->drawString(m_sub.c_str(), false, 21, 74, 16, COL_SUB);
         rainbowLine(r, 20, 88, FB_W - 40, 2);
-        if (m_nx) m_nx->frame(r);
-        // 下の案内(中身が下にはみ出しても隠れるよう、あとから描く)
         r->drawRect(0, FB_H - 74, FB_W, 74, COL_BG);
         r->drawRect(20, FB_H - 73, FB_W - 40, 1, C(5, 5, 7));
         r->drawString("\uE0E1  戻る", false, 30, 693, 22, COL_SUB);
@@ -602,7 +603,10 @@ class NXRow : public NXItem {
 public:
     explicit NXRow(const std::string &label) : m_label(label) {}
 
-    void setValue(const std::string &v) { m_value = v; }
+    void setValue(const std::string &v) {
+        m_value = v;
+        m_vw = -1;  // 幅は、次に描くときに測り直す
+    }
 
     // スイッチの行にする(A で切り替わる。変わったら cb を呼ぶ)
     void setToggle(bool on, std::function<void(bool)> cb) {
@@ -626,7 +630,8 @@ public:
             const s32 ks = th - 6;
             r->drawRect(m_on ? tx + tw - ks - 3 : tx + 3, ty + 3, ks, ks, C(15, 15, 15));
         } else if (!m_value.empty()) {
-            s32 vw = textWidth(r, m_value, 20);
+            if (m_vw < 0) m_vw = textWidth(r, m_value, 20);  // 測るのは、値が変わったときだけ(毎フレームだと重い)
+            s32 vw = m_vw;
             r->drawString(m_value.c_str(), false, x + w - 16 - vw, y + h * 62 / 100, 20, COL_VALUE);
         }
         r->drawRect(x + 8, y + h - 1, w - 16, 1, COL_LINE);
@@ -635,6 +640,7 @@ public:
 private:
     std::string m_label, m_value;
     bool m_toggle = false, m_on = false;
+    s32 m_vw = -1;
     std::function<void(bool)> m_cb;
 };
 
@@ -660,10 +666,11 @@ private:
 
 // ---- 小見出し(灰色の文字と、そのあとに続く細い線) ----
 static tsl::elm::Element *makeHeader(const std::string &text) {
-    return new tsl::elm::CustomDrawer([text](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
-        s32 tw = textWidth(r, text, 17);
+    auto tw = std::make_shared<s32>(-1);  // 文字の幅は、最初に描くときに1回だけ測る
+    return new tsl::elm::CustomDrawer([text, tw](tsl::gfx::Renderer *r, s32 x, s32 y, s32 w, s32 h) {
+        if (*tw < 0) *tw = textWidth(r, text, 17);
         r->drawString(text.c_str(), false, x + 6, y + h - 12, 17, COL_SUB);
-        r->drawRect(x + 6 + tw + 12, y + h - 18, w - tw - 24, 1, C(4, 4, 6));
+        r->drawRect(x + 6 + *tw + 12, y + h - 18, w - *tw - 24, 1, C(4, 4, 6));
     });
 }
 #define HEADER_H 46
