@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="NXShot.png" width="200" alt="MXShot icon">
+  <img src="NXShot.png" width="200" alt="NXShot icon">
 </p>
 
 <h1 align="center">NXShot1.3.3</h1>
@@ -24,7 +24,7 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 ## オーバーレイ版(NXShot.ovl)
 
 <p align="center">
-  <img src="overlay.png" width="200" alt="NXShot ovl">
+  <img src="overlay.png" width="300" alt="NXShot ovl">
 </p>
 
 [Tesla](https://github.com/WerWolv/Tesla-Menu) を入れている人は、**ゲームを遊びながら**、NXShotの設定を変えられます(Teslaメニューを開いて「NXShot」を選びます)。
