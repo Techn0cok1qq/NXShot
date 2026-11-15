@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="NXShot.png" width="200" alt="MXShot アプリアイコン">
+  <img src="NXShot.png" width="200" alt="MXShot icon">
 </p>
 
 <h1 align="center">NXShot1.3.3</h1>
@@ -22,6 +22,11 @@ Nintendo Switch(CFW / Atmosphère)で動く常駐プログラム(sysmodule)で�
 - **アプリ版**: Albumの昔の写真・動画を、**年・月でまとめて**表示します。写真はサムネ付き、動画は最初のコマのサムネと、再生プレビュー付きで選んで送れます。Switchの画面で設定も変えられます。
 
 ## オーバーレイ版(NXShot.ovl)
+
+<p align="center">
+  <img src="overlay.png" width="200" alt="NXShot ovl">
+</p>
+
 [Tesla](https://github.com/WerWolv/Tesla-Menu) を入れている人は、**ゲームを遊びながら**、NXShotの設定を変えられます(Teslaメニューを開いて「NXShot」を選びます)。
 - 写真・動画の**自動送信**、ゲームの開始・終了の**通知**、**大きい動画を削る**、通知の下の**NXShot表示**のオン/オフ(`A` で切り替え)
 - **ゲームのアイコン**の位置(`A` で切り替え)
